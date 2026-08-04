@@ -11,12 +11,21 @@ class LlegueApi {
 
   final DataStore store;
 
-  Router get router {
-    final app = Router();
+  /// Entrada principal: `/` muestra una página simple; el resto va al router.
+  Handler get handler {
+    final routes = router;
+    return (Request request) {
+      final path = request.url.path;
+      if (request.method == 'GET' && (path.isEmpty || path == '/')) {
+        return _homePage();
+      }
+      return routes.call(request);
+    };
+  }
 
-    app.get('/', (Request request) {
-      return Response.ok(
-        '''
+  Response _homePage() {
+    return Response.ok(
+      '''
 <!doctype html>
 <html lang="es">
 <head>
@@ -45,9 +54,12 @@ class LlegueApi {
 </body>
 </html>
 ''',
-        headers: {'content-type': 'text/html; charset=utf-8'},
-      );
-    });
+      headers: {'content-type': 'text/html; charset=utf-8'},
+    );
+  }
+
+  Router get router {
+    final app = Router();
 
     app.get('/health', (Request request) {
       return _json({'ok': true, 'service': 'llegue-backend'});

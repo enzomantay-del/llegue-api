@@ -19,7 +19,7 @@ Future<void> main(List<String> args) async {
   final handler = Pipeline()
       .addMiddleware(logRequests())
       .addMiddleware(corsHeaders())
-      .addHandler(api.router.call);
+      .addHandler(api.handler);
 
   final server = await shelf_io.serve(handler, InternetAddress.anyIPv4, port);
   stdout.writeln('Llegué API escuchando en http://0.0.0.0:${server.port}');
