@@ -1,0 +1,7 @@
+# https://dart.dev/tools/private-files
+# Created by `dart pub`
+.dart_tool/
+.packages
+build/
+data/store.json
+*.exe

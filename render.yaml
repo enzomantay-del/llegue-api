@@ -1,0 +1,15 @@
+# Blueprint para Render.com (API de Llegué).
+# Dashboard → New → Blueprint → apuntá a esta carpeta backend.
+#
+# Nota: en plan free el archivo de datos se reinicia al dormir el servicio.
+# Sirve para pruebas del círculo familiar; después se puede subir de plan o usar DB.
+services:
+  - type: web
+    name: llegue-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: LLEGUE_DATA
+        value: /app/data/store.json
