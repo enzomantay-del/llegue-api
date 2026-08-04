@@ -6,14 +6,24 @@ class Member {
     required this.role,
     required this.token,
     this.receivesAlerts = true,
+    this.familyRole = '',
+    this.birthDate = '',
+    this.pending = false,
+    this.inviteToken = '',
+    this.city = '',
   });
 
   final String id;
   final String familyId;
-  final String name;
+  String name;
   final String role; // adult | child
-  final String token;
+  String token;
   bool receivesAlerts;
+  String familyRole; // Padre, Madre, Hijo/a, Abuelo/a…
+  String birthDate; // YYYY-MM-DD
+  bool pending;
+  String inviteToken;
+  String city;
 
   Map<String, dynamic> toPublicJson() => {
         'id': id,
@@ -21,6 +31,12 @@ class Member {
         'name': name,
         'role': role,
         'receivesAlerts': receivesAlerts,
+        'familyRole': familyRole,
+        'birthDate': birthDate,
+        'pending': pending,
+        'inviteToken': inviteToken,
+        'city': city,
+        'inviteUrlPath': inviteToken.isEmpty ? null : '/i/$inviteToken',
       };
 
   Map<String, dynamic> toStoreJson() => {
@@ -34,8 +50,13 @@ class Member {
       familyId: json['familyId'] as String,
       name: json['name'] as String,
       role: json['role'] as String,
-      token: json['token'] as String,
+      token: json['token'] as String? ?? '',
       receivesAlerts: json['receivesAlerts'] as bool? ?? true,
+      familyRole: json['familyRole'] as String? ?? '',
+      birthDate: json['birthDate'] as String? ?? '',
+      pending: json['pending'] as bool? ?? false,
+      inviteToken: json['inviteToken'] as String? ?? '',
+      city: json['city'] as String? ?? '',
     );
   }
 }

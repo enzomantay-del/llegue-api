@@ -38,7 +38,9 @@ class DataStore {
       final member =
           Member.fromStoreJson(Map<String, dynamic>.from(item as Map));
       membersById[member.id] = member;
-      membersByToken[member.token] = member;
+      if (member.token.isNotEmpty && !member.pending) {
+        membersByToken[member.token] = member;
+      }
     }
     for (final item in (data['events'] as List<dynamic>? ?? [])) {
       events.add(FamilyEvent.fromJson(Map<String, dynamic>.from(item as Map)));
@@ -95,7 +97,17 @@ class DataStore {
     return List.generate(6, (_) => chars[_random.nextInt(chars.length)]).join();
   }
 
-  Future<Map<String, dynamic>> createFamily({required String adminName}) async {
+  String _personalInviteToken() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    return List.generate(10, (_) => chars[_random.nextInt(chars.length)]).join();
+  }
+
+  Future<Map<String, dynamic>> createFamily({
+    required String adminName,
+    String familyRole = 'Padre/Madre',
+    String birthDate = '',
+    String city = '',
+  }) async {
     final family = Family(
       id: _uuid.v4(),
       inviteCode: _inviteCode(),
@@ -110,6 +122,9 @@ class DataStore {
       role: 'adult',
       token: _uuid.v4(),
       receivesAlerts: true,
+      familyRole: familyRole.trim().isEmpty ? 'Padre/Madre' : familyRole.trim(),
+      birthDate: birthDate,
+      city: city,
     );
     membersById[admin.id] = admin;
     membersByToken[admin.token] = admin;
@@ -119,6 +134,73 @@ class DataStore {
       'family': family.toJson(),
       'member': admin.toPublicJson(),
       'token': admin.token,
+    };
+  }
+
+  Future<Map<String, dynamic>> createPendingInvite({
+    required Member actor,
+    required String name,
+    required String role,
+    String familyRole = '',
+    String birthDate = '',
+  }) async {
+    if (actor.role != 'adult') {
+      throw StateError('Solo un adulto puede invitar');
+    }
+    final safeRole = role == 'child' ? 'child' : 'adult';
+    final inviteToken = _personalInviteToken();
+    final member = Member(
+      id: _uuid.v4(),
+      familyId: actor.familyId,
+      name: name.trim().isEmpty
+          ? (safeRole == 'child' ? 'Hijo/a' : 'Familiar')
+          : name.trim(),
+      role: safeRole,
+      token: '',
+      receivesAlerts: safeRole == 'adult',
+      familyRole: familyRole.trim().isEmpty
+          ? (safeRole == 'child' ? 'Hijo/a' : 'Familiar')
+          : familyRole.trim(),
+      birthDate: birthDate,
+      pending: true,
+      inviteToken: inviteToken,
+    );
+    membersById[member.id] = member;
+    await save();
+    return {
+      'member': member.toPublicJson(),
+      'inviteToken': inviteToken,
+    };
+  }
+
+  Member? memberByInviteToken(String token) {
+    final normalized = token.trim().toUpperCase();
+    for (final m in membersById.values) {
+      if (m.inviteToken.toUpperCase() == normalized) return m;
+    }
+    return null;
+  }
+
+  Future<Map<String, dynamic>> claimInvite({required String inviteToken}) async {
+    final member = memberByInviteToken(inviteToken);
+    if (member == null) {
+      throw StateError('Invitación no encontrada');
+    }
+    if (!member.pending && member.token.isNotEmpty) {
+      throw StateError('Esta invitación ya fue usada');
+    }
+    final family = families[member.familyId];
+    if (family == null) {
+      throw StateError('Familia no encontrada');
+    }
+    member.pending = false;
+    member.token = _uuid.v4();
+    membersByToken[member.token] = member;
+    await save();
+    return {
+      'family': family.toJson(),
+      'member': member.toPublicJson(),
+      'token': member.token,
     };
   }
 

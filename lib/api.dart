@@ -69,6 +69,9 @@ class LlegueApi {
       final body = await _body(request);
       final result = await store.createFamily(
         adminName: (body['name'] as String?) ?? 'Adulto',
+        familyRole: (body['familyRole'] as String?) ?? 'Padre/Madre',
+        birthDate: (body['birthDate'] as String?) ?? '',
+        city: (body['city'] as String?) ?? '',
       );
       return _json(result, status: 201);
     });
@@ -85,6 +88,81 @@ class LlegueApi {
       } catch (e) {
         return _error(e.toString().replaceFirst('Bad state: ', ''), status: 404);
       }
+    });
+
+    app.post('/v1/families/invites', (Request request) async {
+      final member = _auth(request);
+      if (member == null) return _unauthorized();
+      final body = await _body(request);
+      try {
+        final result = await store.createPendingInvite(
+          actor: member,
+          name: (body['name'] as String?) ?? '',
+          role: (body['role'] as String?) ?? 'adult',
+          familyRole: (body['familyRole'] as String?) ?? '',
+          birthDate: (body['birthDate'] as String?) ?? '',
+        );
+        return _json(result, status: 201);
+      } catch (e) {
+        return _error(e.toString().replaceFirst('Bad state: ', ''), status: 403);
+      }
+    });
+
+    app.get('/v1/invites/<token>', (Request request, String token) {
+      final member = store.memberByInviteToken(token);
+      if (member == null) {
+        return _error('Invitación no encontrada', status: 404);
+      }
+      final family = store.families[member.familyId];
+      return _json({
+        'inviteToken': member.inviteToken,
+        'name': member.name,
+        'role': member.role,
+        'familyRole': member.familyRole,
+        'birthDate': member.birthDate,
+        'pending': member.pending,
+        'familyInviteCode': family?.inviteCode,
+      });
+    });
+
+    app.post('/v1/families/join-invite', (Request request) async {
+      final body = await _body(request);
+      try {
+        final result = await store.claimInvite(
+          inviteToken: (body['inviteToken'] as String?) ?? '',
+        );
+        return _json(result, status: 201);
+      } catch (e) {
+        return _error(e.toString().replaceFirst('Bad state: ', ''), status: 404);
+      }
+    });
+
+    app.get('/i/<token>', (Request request, String token) {
+      final member = store.memberByInviteToken(token);
+      if (member == null) {
+        return Response.notFound(
+          _inviteHtml(
+            title: 'Invitación no encontrada',
+            body: 'Este link ya no es válido. Pedile uno nuevo a tu familia.',
+            token: '',
+          ),
+          headers: {'content-type': 'text/html; charset=utf-8'},
+        );
+      }
+      final roleLabel = member.familyRole.isEmpty
+          ? (member.role == 'child' ? 'Hijo/a' : 'Familiar')
+          : member.familyRole;
+      return Response.ok(
+        _inviteHtml(
+          title: 'Te invitaron a Llegué',
+          body:
+              '${member.name} ($roleLabel) ya está cargado/a en la familia. '
+              'Descargá la app, abrila y tocá “Tengo un código”. '
+              'Pegá este código personal:',
+          token: member.inviteToken,
+        ),
+        headers: {'content-type': 'text/html; charset=utf-8'},
+      );
     });
 
     app.get('/v1/me', (Request request) {
@@ -208,4 +286,43 @@ class LlegueApi {
   }
 
   Response _unauthorized() => _error('No autorizado', status: 401);
+
+  String _inviteHtml({
+    required String title,
+    required String body,
+    required String token,
+  }) {
+    final codeBlock = token.isEmpty
+        ? ''
+        : '<p class="code">$token</p><p>En la app: <strong>Tengo un código</strong> → pegá ese código.</p>';
+    return '''
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>$title</title>
+  <style>
+    body { font-family: Georgia, serif; margin: 0; min-height: 100vh;
+      background: linear-gradient(160deg, #e8f4ef, #f7f3eb); color: #1c2b28;
+      display: grid; place-items: center; padding: 24px; }
+    main { max-width: 420px; background: rgba(255,255,255,.85);
+      border: 1px solid rgba(28,43,40,.08); border-radius: 20px; padding: 28px; }
+    h1 { margin: 0 0 12px; font-size: 1.7rem; }
+    p { margin: 0 0 12px; line-height: 1.45; color: #5c6f6a; }
+    .code { font-size: 1.8rem; font-weight: 800; letter-spacing: 3px;
+      color: #146b56; background: rgba(31,138,112,.12); padding: 14px;
+      border-radius: 14px; text-align: center; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>$title</h1>
+    <p>$body</p>
+    $codeBlock
+  </main>
+</body>
+</html>
+''';
+  }
 }
