@@ -21,14 +21,16 @@ Health: `http://localhost:8787/health`
 4. Adulto: **Crear círculo familiar** → copiá el código.
 5. Otro dispositivo: **Unirme al círculo** con ese código.
 
-## Subir a la nube (siguiente paso del plan)
+## Nube (Render) — activo
 
-Hay un `Dockerfile` y un `render.yaml` listos.
+| | |
+|--|--|
+| URL | https://llegue-api.onrender.com |
+| Health | https://llegue-api.onrender.com/health |
+| Repo | https://github.com/enzomantay-del/llegue-api |
+| Dashboard | https://dashboard.render.com |
 
-1. Creá cuenta en [Render](https://render.com) (plan free alcanza para probar).
-2. New → Blueprint → elegí este backend (o Web Service + Docker).
-3. Cuando esté online, copiá la URL (ej. `https://llegue-api.onrender.com`).
-4. En la app → Familia → pegá esa URL → Probar conexión.
+En la app → **Familia** → pegá esa URL → **Probar conexión**.
 
 En plan free el servicio puede “dormir” tras un rato sin uso; el primer aviso tarda unos segundos en despertar.
 
