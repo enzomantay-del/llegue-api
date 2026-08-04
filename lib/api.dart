@@ -14,6 +14,41 @@ class LlegueApi {
   Router get router {
     final app = Router();
 
+    app.get('/', (Request request) {
+      return Response.ok(
+        '''
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Llegué API</title>
+  <style>
+    body { font-family: Georgia, serif; margin: 0; min-height: 100vh;
+      background: linear-gradient(160deg, #e8f4ef, #f7f3eb); color: #1c2b28;
+      display: grid; place-items: center; padding: 24px; }
+    main { max-width: 420px; background: rgba(255,255,255,.8);
+      border: 1px solid rgba(28,43,40,.08); border-radius: 20px; padding: 28px; }
+    h1 { margin: 0 0 8px; font-size: 2rem; }
+    p { margin: 0 0 12px; line-height: 1.45; color: #5c6f6a; }
+    a { color: #146b56; font-weight: 700; }
+    code { background: rgba(31,138,112,.12); padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Llegué</h1>
+    <p>API del círculo familiar. Esta página es solo para comprobar que el servidor está vivo.</p>
+    <p>Estado: <a href="/health"><code>/health</code></a></p>
+    <p>En la app, usá esta URL en <strong>Familia → Servidor</strong>.</p>
+  </main>
+</body>
+</html>
+''',
+        headers: {'content-type': 'text/html; charset=utf-8'},
+      );
+    });
+
     app.get('/health', (Request request) {
       return _json({'ok': true, 'service': 'llegue-backend'});
     });
