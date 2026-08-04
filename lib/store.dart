@@ -62,6 +62,15 @@ class DataStore {
     await file.writeAsString(const JsonEncoder.withIndent('  ').convert(payload));
   }
 
+  Future<void> wipeAll() async {
+    families.clear();
+    membersById.clear();
+    membersByToken.clear();
+    events.clear();
+    configs.clear();
+    await save();
+  }
+
   Map<String, dynamic> getConfig(String familyId) {
     return configs[familyId] ??
         {

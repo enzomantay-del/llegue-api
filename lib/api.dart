@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:shelf/shelf.dart';
 import 'package:shelf_router/shelf_router.dart';
@@ -63,6 +64,22 @@ class LlegueApi {
 
     app.get('/health', (Request request) {
       return _json({'ok': true, 'service': 'llegue-backend'});
+    });
+
+    /// Borra familias, miembros, eventos y rutinas del servidor (pruebas).
+    app.post('/v1/admin/wipe', (Request request) async {
+      final key = request.headers['x-admin-key'] ??
+          request.url.queryParameters['key'];
+      const expected = String.fromEnvironment(
+        'LLEGUE_ADMIN_KEY',
+        defaultValue: 'llegue-wipe-familia',
+      );
+      final envKey = Platform.environment['LLEGUE_ADMIN_KEY'] ?? expected;
+      if (key != envKey) {
+        return _error('No autorizado', status: 401);
+      }
+      await store.wipeAll();
+      return _json({'ok': true, 'wiped': true});
     });
 
     app.post('/v1/families', (Request request) async {
