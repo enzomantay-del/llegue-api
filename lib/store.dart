@@ -295,6 +295,14 @@ class DataStore {
     required DateTime since,
     required String viewerMemberId,
   }) {
+    final viewer = membersById[viewerMemberId];
+    // Solo adultos con avisos activos reciben el feed de notificaciones.
+    if (viewer == null ||
+        viewer.role != 'adult' ||
+        !viewer.receivesAlerts) {
+      return [];
+    }
+
     return events.where((e) {
       if (e.familyId != familyId) return false;
       if (e.actorMemberId == viewerMemberId) return false;

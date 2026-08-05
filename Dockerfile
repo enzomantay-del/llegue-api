@@ -10,8 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /app/server /app/server
-RUN mkdir -p /app/data
+COPY public /app/public
+RUN mkdir -p /app/data /app/public
 ENV PORT=8787
 ENV LLEGUE_DATA=/app/data/store.json
+ENV LLEGUE_APK=/app/public/Llegue.apk
 EXPOSE 8787
 CMD ["/app/server"]

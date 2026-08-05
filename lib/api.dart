@@ -154,6 +154,32 @@ class LlegueApi {
       }
     });
 
+    app.get('/download', (Request request) {
+      return Response.ok(
+        _downloadHtml(),
+        headers: {'content-type': 'text/html; charset=utf-8'},
+      );
+    });
+
+    app.get('/apk/Llegue.apk', (Request request) async {
+      final file = _apkFile();
+      if (file == null || !await file.exists()) {
+        return Response.notFound(
+          _downloadHtml(missingApk: true),
+          headers: {'content-type': 'text/html; charset=utf-8'},
+        );
+      }
+      final bytes = await file.readAsBytes();
+      return Response.ok(
+        bytes,
+        headers: {
+          'content-type': 'application/vnd.android.package-archive',
+          'content-disposition': 'attachment; filename="Llegue.apk"',
+          'content-length': '${bytes.length}',
+        },
+      );
+    });
+
     app.get('/i/<token>', (Request request, String token) {
       final member = store.memberByInviteToken(token);
       if (member == null) {
@@ -162,6 +188,7 @@ class LlegueApi {
             title: 'Invitación no encontrada',
             body: 'Este link ya no es válido. Pedile uno nuevo a tu familia.',
             token: '',
+            name: '',
           ),
           headers: {'content-type': 'text/html; charset=utf-8'},
         );
@@ -173,10 +200,10 @@ class LlegueApi {
         _inviteHtml(
           title: 'Te invitaron a Llegué',
           body:
-              '${member.name} ($roleLabel) ya está cargado/a en la familia. '
-              'Descargá la app, abrila y tocá “Tengo un código”. '
-              'Pegá este código personal:',
+              '${member.name} ($roleLabel) ya está en la familia. '
+              'Primero descargá la app, después usá tu código.',
           token: member.inviteToken,
+          name: member.name,
         ),
         headers: {'content-type': 'text/html; charset=utf-8'},
       );
@@ -304,14 +331,79 @@ class LlegueApi {
 
   Response _unauthorized() => _error('No autorizado', status: 401);
 
+  File? _apkFile() {
+    final candidates = [
+      Platform.environment['LLEGUE_APK'],
+      '${Directory.current.path}${Platform.pathSeparator}public${Platform.pathSeparator}Llegue.apk',
+      '/app/public/Llegue.apk',
+    ];
+    for (final path in candidates) {
+      if (path == null || path.isEmpty) continue;
+      final f = File(path);
+      if (f.existsSync()) return f;
+    }
+    return null;
+  }
+
+  String _downloadHtml({bool missingApk = false}) {
+    final hasApk = !missingApk && _apkFile() != null;
+    final button = hasApk
+        ? '<a class="btn" href="/apk/Llegue.apk">Descargar Llegué (Android)</a>'
+        : '<p class="warn">El archivo de descarga se está preparando. '
+            'Pedile a quien te invitó que te mande el archivo <strong>Llegue.apk</strong> por WhatsApp.</p>';
+    return '''
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Descargar Llegué</title>
+  <style>
+    body { font-family: "Segoe UI", system-ui, sans-serif; margin: 0; min-height: 100vh;
+      background: linear-gradient(155deg, #0f3d34, #1f8a70 55%, #3d2a1a); color: #fff;
+      display: grid; place-items: center; padding: 24px; }
+    main { max-width: 420px; width: 100%; background: rgba(255,255,255,.12);
+      border: 1px solid rgba(255,255,255,.18); border-radius: 24px; padding: 28px;
+      backdrop-filter: blur(8px); }
+    h1 { font-family: Georgia, serif; margin: 0 0 10px; font-size: 2rem; }
+    p { margin: 0 0 14px; line-height: 1.45; color: rgba(255,255,255,.82); }
+    .btn { display: block; text-align: center; text-decoration: none; color: #0f3d34;
+      background: #fff; font-weight: 800; padding: 16px 18px; border-radius: 16px;
+      margin: 18px 0 10px; }
+    .warn { background: rgba(225,90,79,.25); padding: 12px; border-radius: 12px; }
+    ol { margin: 0; padding-left: 1.2rem; color: rgba(255,255,255,.82); line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Llegué</h1>
+    <p>Avisame cuando llegues. App para familias.</p>
+    $button
+    <p><strong>Después de instalar:</strong></p>
+    <ol>
+      <li>Abrí Llegué</li>
+      <li>Tocá <strong>Tengo un código</strong></li>
+      <li>Pegá el código que te mandaron</li>
+    </ol>
+  </main>
+</body>
+</html>
+''';
+  }
+
   String _inviteHtml({
     required String title,
     required String body,
     required String token,
+    required String name,
   }) {
     final codeBlock = token.isEmpty
         ? ''
-        : '<p class="code">$token</p><p>En la app: <strong>Tengo un código</strong> → pegá ese código.</p>';
+        : '''
+    <p class="label">Tu código</p>
+    <p class="code">$token</p>
+    <p>En la app: <strong>Tengo un código</strong> → pegá ese código.</p>
+''';
     return '''
 <!doctype html>
 <html lang="es">
@@ -320,22 +412,31 @@ class LlegueApi {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>$title</title>
   <style>
-    body { font-family: Georgia, serif; margin: 0; min-height: 100vh;
-      background: linear-gradient(160deg, #e8f4ef, #f7f3eb); color: #1c2b28;
+    body { font-family: "Segoe UI", system-ui, sans-serif; margin: 0; min-height: 100vh;
+      background: linear-gradient(155deg, #0f3d34, #1f8a70 55%, #3d2a1a); color: #fff;
       display: grid; place-items: center; padding: 24px; }
-    main { max-width: 420px; background: rgba(255,255,255,.85);
-      border: 1px solid rgba(28,43,40,.08); border-radius: 20px; padding: 28px; }
-    h1 { margin: 0 0 12px; font-size: 1.7rem; }
-    p { margin: 0 0 12px; line-height: 1.45; color: #5c6f6a; }
-    .code { font-size: 1.8rem; font-weight: 800; letter-spacing: 3px;
-      color: #146b56; background: rgba(31,138,112,.12); padding: 14px;
-      border-radius: 14px; text-align: center; }
+    main { max-width: 420px; width: 100%; background: rgba(255,255,255,.12);
+      border: 1px solid rgba(255,255,255,.18); border-radius: 24px; padding: 28px; }
+    h1 { font-family: Georgia, serif; margin: 0 0 12px; font-size: 1.85rem; }
+    p { margin: 0 0 12px; line-height: 1.45; color: rgba(255,255,255,.82); }
+    .label { font-size: 12px; letter-spacing: 1px; text-transform: uppercase;
+      font-weight: 700; color: rgba(255,255,255,.6); margin-bottom: 6px; }
+    .code { font-family: Georgia, serif; font-size: 1.9rem; font-weight: 800;
+      letter-spacing: 3px; color: #fff; background: rgba(0,0,0,.22); padding: 16px;
+      border-radius: 16px; text-align: center; }
+    .btn { display: block; text-align: center; text-decoration: none; color: #0f3d34;
+      background: #fff; font-weight: 800; padding: 16px 18px; border-radius: 16px;
+      margin: 8px 0 18px; }
+    .step { font-weight: 700; color: #fff; }
   </style>
 </head>
 <body>
   <main>
     <h1>$title</h1>
     <p>$body</p>
+    <p class="step">1. Descargá la app</p>
+    <a class="btn" href="/download">Descargar Llegué (Android)</a>
+    <p class="step">2. Entrá con tu código</p>
     $codeBlock
   </main>
 </body>
