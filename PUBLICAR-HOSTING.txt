@@ -1,27 +1,17 @@
-Publicar Llegué API en la nube (URL fija)
+﻿Publicar Llegué API en Render (URL fija)
 
-Por qué ayuda
-- El celular siempre usa la misma dirección (ej. https://llegue-api.onrender.com)
-- No depende de la IP de tu WiFi
-- Al actualizar el APK, no cambiás el servidor
+Repo listo:
+https://github.com/enzomantay-del/llegue-api
 
-Opción recomendada hoy: Render (cuenta gratis)
-1) Creá cuenta en https://render.com
-2) New → Web Service → conectá esta carpeta `services/api` (o subí el repo)
-3) Runtime: Docker (usa el Dockerfile de esta carpeta)
-4) Tras el deploy, copiá la URL https://….onrender.com
-5) En ambos celulares: Servidor → pegá esa URL → Guardar
-6) Entrá con los teléfonos de datos-familia.json + código 123456
+1) https://dashboard.render.com/web/new
+2) Conectá GitHub → repo llegue-api
+3) Runtime: Docker · Plan: Free · Branch: main
+4) Variables:
+   OTP_DEV_CODE=123456
+   OTP_EXPOSE_DEV_CODE=false
+   SEED_FAMILIA=false
+   INVITE_PUBLIC_BASE_URL=https://TU-SERVICIO.onrender.com
+5) Create Web Service → esperá "Live"
+6) Copiá la URL https://….onrender.com y avisá para actualizar la APK
 
-Nota del plan gratis de Render
-- Si nadie usa la API un rato, se “duerme”.
-- Al abrir la app puede tardar ~30–60 s la primera vez.
-- Al despertar, vuelve a cargar la familia desde datos-familia.json (mismos IDs).
-- Si el token viejo fallara, solo reingresás con teléfono + 123456 (no rearmás lugares).
-
-Para disco persistente de verdad (sin re-sembrar) hace falta plan pago o Postgres.
-Para la prueba familiar, seed + URL fija ya simplifica mucho.
-
-Después de publicar
-- Actualizá en el celular el Servidor una sola vez.
-- Dejá de usar IPs 192.168… salvo pruebas locales.
+Plan gratis: puede dormirse; la 1ª apertura tarda ~30–60 s.

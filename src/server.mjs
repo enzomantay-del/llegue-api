@@ -1091,7 +1091,10 @@ function publicInviteBase(raw, reqHost) {
     return value;
   }
   if (reqHost && !/localhost|127\.0\.0\.1/i.test(reqHost)) {
-    return `http://${reqHost}`;
+    const host = String(reqHost).replace(/\/$/, '');
+    const httpsHost = /onrender\.com$/i.test(host.split(':')[0]) ||
+      /\.trycloudflare\.com$/i.test(host.split(':')[0]);
+    return `${httpsHost ? 'https' : 'http'}://${host}`;
   }
   if (value && /^https?:\/\//i.test(value)) return value;
   return inviteBase();
