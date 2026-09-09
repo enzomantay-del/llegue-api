@@ -1,0 +1,37 @@
+{
+  "_lee_esto": "Editá UNA sola vez los teléfonos reales (solo números, con código de país). Guardá, corré INICIAR-PRUEBA-FACIL.bat y listo. OTP de prueba: siempre 123456. PIN de Mateo: 1234.",
+  "family": {
+    "id": "seed-family-mantay",
+    "name": "Familia Mantay"
+  },
+  "adult": {
+    "id": "seed-adult-enzo",
+    "name": "Enzo Gabriel Mantay",
+    "phone": "5493743483429",
+    "relationshipLabel": "Padre"
+  },
+  "kid": {
+    "id": "seed-kid-mateo",
+    "name": "Mateo",
+    "phone": "5493743489328",
+    "pin": "1234"
+  },
+  "places": [
+    {
+      "id": "seed-place-casa",
+      "name": "Casa",
+      "type": "home",
+      "lat": -27.0433,
+      "lng": -55.2269,
+      "radiusM": 120
+    },
+    {
+      "id": "seed-place-colegio",
+      "name": "Colegio",
+      "type": "school",
+      "lat": -27.04,
+      "lng": -55.23,
+      "radiusM": 120
+    }
+  ]
+}

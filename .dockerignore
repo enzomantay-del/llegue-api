@@ -1,0 +1,10 @@
+node_modules
+data
+.env
+.env.*
+tools
+*.log
+firebase-service-account.json
+.git
+prisma
+npm-install.log

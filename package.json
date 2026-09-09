@@ -1,0 +1,12 @@
+{
+  "name": "llegue-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --experimental-sqlite src/server.mjs",
+    "start": "node --experimental-sqlite src/server.mjs",
+    "db:init": "node --experimental-sqlite src/db-init.mjs",
+    "db:seed": "node --experimental-sqlite src/seed-familia.mjs"
+  }
+}

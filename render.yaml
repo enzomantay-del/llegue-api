@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: llegue-api
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: OTP_DEV_CODE
+        value: "123456"
+      - key: OTP_EXPOSE_DEV_CODE
+        value: "false"
+      - key: SEED_FAMILIA
+        value: "false"
+      - key: INVITE_PUBLIC_BASE_URL
+        sync: false
