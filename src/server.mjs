@@ -11,7 +11,7 @@ import { seedFamilia } from './seed-familia.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
 const dataDir = path.join(root, 'data');
-const dbPath = path.join(dataDir, 'llegue.db');
+const dbPath = process.env.LLEGUE_DB_PATH || path.join(dataDir, 'llegue.db');
 fs.mkdirSync(dataDir, { recursive: true });
 
 // Cargar .env simple
@@ -338,6 +338,22 @@ function isAdultRole(role) {
   return role === 'admin_adult' || role === 'adult';
 }
 
+function familyHomePlace(familyId) {
+  if (!familyId) return null;
+  return db
+    .prepare(
+      `SELECT * FROM places
+       WHERE family_id = ? AND type = 'home' AND status = 'active'
+       ORDER BY created_at ASC LIMIT 1`,
+    )
+    .get(familyId);
+}
+
+/** Viaje armado por POST /trips (no el que abre solo un departure de rutina). */
+function isPlannedSpecialTrip(trip) {
+  return Boolean(trip && !trip.routine_id && trip.destination_place_id);
+}
+
 function placePublic(p) {
   return {
     id: p.id,
@@ -366,6 +382,8 @@ function tripPublic(t) {
     startedAt: t.started_at,
     endedAt: t.ended_at,
     createdAt: t.created_at,
+    phase: t.phase ?? null,
+    departedAt: t.departed_at ?? null,
   };
 }
 
@@ -706,8 +724,9 @@ function createEvent({
     };
   }
 
-  const place = placeId
-    ? db.prepare('SELECT * FROM places WHERE id = ?').get(placeId)
+  let resolvedPlaceId = placeId;
+  let place = resolvedPlaceId
+    ? db.prepare('SELECT * FROM places WHERE id = ?').get(resolvedPlaceId)
     : null;
   let notify = true;
   if (forceNotify != null) {
@@ -738,6 +757,34 @@ function createEvent({
       ).run(resolvedTripId, kid.id, nowIso(), nowIso());
     }
   }
+  if (type === 'arrival' && !resolvedTripId) {
+    const existing = db
+      .prepare(
+        `SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC LIMIT 1`,
+      )
+      .get(kid.id);
+    if (existing) resolvedTripId = existing.id;
+  }
+
+  let activeTrip = resolvedTripId
+    ? db.prepare('SELECT * FROM trips WHERE id = ?').get(resolvedTripId)
+    : null;
+
+  // Llegada sin lugar en una salida especial ya en destino → Casa (no reusar el super)
+  if (
+    type === 'arrival' &&
+    !place &&
+    isPlannedSpecialTrip(activeTrip) &&
+    (activeTrip.phase === 'at_destination' || activeTrip.phase === 'returning')
+  ) {
+    const dest = db
+      .prepare('SELECT * FROM places WHERE id = ?')
+      .get(activeTrip.destination_place_id);
+    if (dest?.type !== 'home') {
+      place = familyHomePlace(kid.family_id);
+      if (place) resolvedPlaceId = place.id;
+    }
+  }
 
   const baseMessage = eventMessage(type, kid.name, place?.name);
   // La hora se muestra en la app desde createdAt (zona del celular).
@@ -753,7 +800,7 @@ function createEvent({
     kid.id,
     resolvedTripId,
     type,
-    placeId,
+    resolvedPlaceId,
     notify ? 1 : 0,
     message,
     payload ? JSON.stringify(payload) : null,
@@ -762,14 +809,43 @@ function createEvent({
   const event = db.prepare('SELECT * FROM events WHERE id = ?').get(id);
 
   if (type === 'arrival') {
-    if (resolvedTripId) {
+    const arrivedHome = place?.type === 'home';
+    const arrivedAtDest =
+      activeTrip?.destination_place_id &&
+      resolvedPlaceId === activeTrip.destination_place_id;
+    // Salida especial (super, etc.): ENTER destino NO cierra; ENTER Casa sí.
+    // Viajes abiertos por rutina/departure: cualquier llegada cierra (igual que antes).
+    const shouldClose =
+      !isPlannedSpecialTrip(activeTrip) || arrivedHome;
+    if (shouldClose) {
+      if (resolvedTripId) {
+        db.prepare(
+          `UPDATE trips SET status = 'arrived', ended_at = ? WHERE id = ? AND status IN ('active','overdue')`,
+        ).run(nowIso(), resolvedTripId);
+      } else {
+        db.prepare(
+          `UPDATE trips SET status = 'arrived', ended_at = ? WHERE kid_id = ? AND status IN ('active','overdue')`,
+        ).run(nowIso(), kid.id);
+      }
+    } else if (arrivedAtDest && activeTrip) {
+      db.prepare(`UPDATE trips SET phase = 'at_destination' WHERE id = ?`).run(
+        activeTrip.id,
+      );
+    }
+  }
+  if (type === 'departure' && activeTrip && isPlannedSpecialTrip(activeTrip)) {
+    const now = nowIso();
+    if (place?.type === 'home') {
       db.prepare(
-        `UPDATE trips SET status = 'arrived', ended_at = ? WHERE id = ? AND status IN ('active','overdue')`,
-      ).run(nowIso(), resolvedTripId);
-    } else {
+        `UPDATE trips SET phase = 'en_route', departed_at = COALESCE(departed_at, ?) WHERE id = ? AND status IN ('active','overdue')`,
+      ).run(now, activeTrip.id);
+    } else if (
+      resolvedPlaceId &&
+      resolvedPlaceId === activeTrip.destination_place_id
+    ) {
       db.prepare(
-        `UPDATE trips SET status = 'arrived', ended_at = ? WHERE kid_id = ? AND status IN ('active','overdue')`,
-      ).run(nowIso(), kid.id);
+        `UPDATE trips SET phase = 'returning' WHERE id = ? AND status IN ('active','overdue')`,
+      ).run(activeTrip.id);
     }
   }
   if (type === 'im_ok') {
@@ -824,6 +900,7 @@ function checkDelayedTrips() {
     )
     .all(now);
   for (const trip of overdue) {
+    if (trip.phase === 'pending_departure') continue;
     const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(trip.kid_id);
     if (!kid) continue;
     const already = db
@@ -851,9 +928,16 @@ function checkReturnPrompts() {
       `SELECT * FROM trips
        WHERE status = 'active'
          AND expected_return_at IS NULL
-         AND started_at <= ?`,
+         AND (
+           departed_at <= ?
+           OR (
+             departed_at IS NULL
+             AND (phase IS NULL OR phase = '')
+             AND started_at <= ?
+           )
+         )`,
     )
-    .all(cutoff);
+    .all(cutoff, cutoff);
   for (const trip of openTrips) {
     const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(trip.kid_id);
     if (!kid) continue;
@@ -963,6 +1047,7 @@ function memberPresence(m, lastEvent, activeTrip, healthIssue) {
 
   const needsGoHome =
     Boolean(activeTrip) &&
+    activeTrip.phase !== 'pending_departure' &&
     (activeTrip.expected_return_at == null ||
       lastType === 'return_prompt' ||
       activeTrip.status === 'overdue');
@@ -975,7 +1060,7 @@ function memberPresence(m, lastEvent, activeTrip, healthIssue) {
       needsGoHome,
     };
   }
-  if (activeTrip) {
+  if (activeTrip && activeTrip.phase !== 'pending_departure') {
     if (activeTrip.status === 'overdue') {
       return {
         presenceStatus: 'alert',
@@ -2327,40 +2412,28 @@ const server = http.createServer(async (req, res) => {
       }
       const id = uuid();
       const expected = body.expectedReturnAt ? String(body.expectedReturnAt) : null;
+      const home = familyHomePlace(user.family_id);
+      const phase = dest?.id ? 'pending_departure' : null;
       db.prepare(
         `INSERT INTO trips
-         (id, kid_id, destination_place_id, status, expected_return_at, started_at, created_at)
-         VALUES (?, ?, ?, 'active', ?, ?, ?)`,
-      ).run(id, kid.id, dest?.id ?? null, expected, nowIso(), nowIso());
+         (id, kid_id, origin_place_id, destination_place_id, status, expected_return_at, started_at, created_at, phase, departed_at)
+         VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL)`,
+      ).run(id, kid.id, home?.id ?? null, dest?.id ?? null, expected, nowIso(), nowIso(), phase);
       const trip = db.prepare('SELECT * FROM trips WHERE id = ?').get(id);
-      const destIsHome = dest?.type === 'home';
-      const kind = String(body.kind ?? '');
-      let eventType = 'going_to';
-      if (kind === 'walking_home' || destIsHome) {
-        eventType = 'walking_home';
-      } else if (!dest) {
-        eventType = 'going_to';
-      }
-      const { event, notifiedCount } = createEvent({
-        kid,
-        type: eventType,
-        placeId: dest?.id ?? null,
-        tripId: id,
-        forceNotify: true,
-      });
-      // Si el adulto arma la salida, avisamos al hijo/a (única excepción de avisos al menor).
+      // Solo crea el viaje. Cero push familiar de “salió”: el primer aviso es EXIT Casa.
+      let notifiedCount = 0;
       if (isAdultRole(user.role)) {
+        const destIsHome = dest?.type === 'home';
         const destLabel = dest?.name ? ` a ${dest.name}` : '';
-        notifyKidUser(
+        notifiedCount = notifyKidUser(
           kid.id,
           'Salida especial',
-          eventType === 'walking_home'
-              ? 'Te armaron un regreso a casa'
-              : `Te armaron una salida especial${destLabel}`,
-          event.id,
+          destIsHome || String(body.kind ?? '') === 'walking_home'
+            ? 'Te armaron un regreso a casa'
+            : `Te armaron una salida especial${destLabel}`,
         );
       }
-      return send(res, 201, { trip: tripPublic(trip), event, notifiedCount });
+      return send(res, 201, { trip: tripPublic(trip), event: null, notifiedCount });
     }
 
     if (req.method === 'PATCH' && pathname.startsWith('/trips/')) {
@@ -2417,6 +2490,10 @@ const server = http.createServer(async (req, res) => {
           tripId: trip.id,
           forceNotify: true,
         });
+        // Marcado manual: cierra igual (ENTER destino de una especial no cierra solo).
+        db.prepare(
+          `UPDATE trips SET status = 'arrived', ended_at = COALESCE(ended_at, ?) WHERE id = ? AND status IN ('active','overdue')`,
+        ).run(nowIso(), tripId);
         const updated = db.prepare('SELECT * FROM trips WHERE id = ?').get(tripId);
         return send(res, 200, { trip: tripPublic(updated), event, notifiedCount });
       }
@@ -2475,7 +2552,15 @@ const server = http.createServer(async (req, res) => {
           .prepare(`SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue')`)
           .get(kid.id);
         tripId = active?.id ?? null;
-        if (!placeId && active?.destination_place_id) placeId = active.destination_place_id;
+        if (!placeId && active?.destination_place_id) {
+          const dest = db
+            .prepare('SELECT * FROM places WHERE id = ?')
+            .get(active.destination_place_id);
+          // No asumir el destino en salidas especiales (ENTER Casa no es el super).
+          if (!isPlannedSpecialTrip(active) || dest?.type === 'home') {
+            placeId = active.destination_place_id;
+          }
+        }
       }
 
       const result = createEvent({
