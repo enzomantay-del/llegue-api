@@ -48,6 +48,8 @@ const JWT_SECRET = process.env.JWT_SECRET ?? 'llegue-dev-secret';
 const JWT_REFRESH = process.env.JWT_REFRESH_SECRET ?? 'llegue-dev-refresh';
 const OTP_DEV_CODE = process.env.OTP_DEV_CODE ?? '123456';
 const OTP_EXPOSE = (process.env.OTP_EXPOSE_DEV_CODE ?? 'false') === 'true';
+/** Zona horaria de la familia (Argentina). Render corre en UTC; sin esto los avisos salen +3h. */
+const APP_TZ = process.env.APP_TZ || 'America/Argentina/Buenos_Aires';
 
 /** Preferí URL-PUBLICA.txt (túnel) si existe, sino .env / localhost */
 function resolveInviteBase() {
@@ -76,11 +78,47 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-/** Hora local del servidor (misma zona que la PC de prueba). */
+function zonedParts(d = new Date(), timeZone = APP_TZ) {
+  const parts = {};
+  for (const p of new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+    weekday: 'short',
+  }).formatToParts(d)) {
+    if (p.type !== 'literal') parts[p.type] = p.value;
+  }
+  return parts;
+}
+
+/** Hora local de la familia (no la del servidor UTC de Render). */
 function clockLabel(d = new Date()) {
-  const h = String(d.getHours()).padStart(2, '0');
-  const m = String(d.getMinutes()).padStart(2, '0');
-  return `${h}:${m}`;
+  const p = zonedParts(d);
+  return `${p.hour}:${p.minute}`;
+}
+
+/** 1=lunes … 7=domingo en zona APP_TZ */
+function todayWeekday(d = new Date()) {
+  const map = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
+  const wd = zonedParts(d).weekday;
+  return map[wd] ?? 1;
+}
+
+function localMinutesNow(d = new Date()) {
+  const p = zonedParts(d);
+  return Number(p.hour) * 60 + Number(p.minute);
+}
+
+/** Inicio del día local (Argentina) como ISO, para filtrar eventos “de hoy”. */
+function startOfLocalDayIso(d = new Date()) {
+  const p = zonedParts(d);
+  // Argentina no usa DST; offset fijo -03:00
+  return `${p.year}-${p.month}-${p.day}T00:00:00.000-03:00`;
 }
 
 function b64url(input) {
@@ -375,20 +413,12 @@ function routineMatchesNow(routine, placeId, toleranceMin = 15) {
   if (!routine.active) return false;
   if (placeId && routine.place_id !== placeId) return false;
   const days = parseDays(routine.days_of_week);
-  const now = new Date();
-  // JS: 0=domingo … usamos 1=lunes … 7=domingo
-  const jsDay = now.getDay();
-  const day = jsDay === 0 ? 7 : jsDay;
+  const day = todayWeekday();
   if (!days.includes(day)) return false;
-  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const nowMin = localMinutesNow();
   const start = minutesOfDay(routine.start_time) - toleranceMin;
   const end = minutesOfDay(routine.end_time) + toleranceMin;
   return nowMin >= start && nowMin <= end;
-}
-
-function todayWeekday() {
-  const jsDay = new Date().getDay();
-  return jsDay === 0 ? 7 : jsDay;
 }
 
 function defaultAlertPrefs() {
@@ -710,8 +740,9 @@ function createEvent({
   }
 
   const baseMessage = eventMessage(type, kid.name, place?.name);
-  const at = clockLabel();
-  const message = `${baseMessage} · ${at}`;
+  // La hora se muestra en la app desde createdAt (zona del celular).
+  // No la incrustamos acá: en Render UTC salía desfasada (+3h en Argentina).
+  const message = baseMessage;
   const id = uuid();
   db.prepare(
     `INSERT INTO events
@@ -848,12 +879,9 @@ function checkReturnPrompts() {
 function checkRoutineDelays() {
   const graceAfterStartMin = 5;
   const day = todayWeekday();
-  const now = new Date();
-  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const nowMin = localMinutesNow();
   const routines = db.prepare(`SELECT * FROM routines WHERE active = 1`).all();
-  const dayStart = new Date(now);
-  dayStart.setHours(0, 0, 0, 0);
-  const dayStartIso = dayStart.toISOString();
+  const dayStartIso = startOfLocalDayIso();
 
   for (const routine of routines) {
     const days = parseDays(routine.days_of_week);
