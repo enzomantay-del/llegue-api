@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS trips (
   started_at TEXT NOT NULL,
   ended_at TEXT,
   created_at TEXT NOT NULL,
+  phase TEXT,
+  departed_at TEXT,
   FOREIGN KEY (kid_id) REFERENCES users(id)
 );
 
@@ -209,5 +211,14 @@ CREATE TABLE IF NOT EXISTS account_profiles (
     ).run();
   } catch {
     // tabla todavía no existe en installs muy viejas
+  }
+
+  // Salida especial: fase y hora real de salida (DBs viejas)
+  const tripCols = db.prepare(`PRAGMA table_info(trips)`).all().map((c) => c.name);
+  if (!tripCols.includes('phase')) {
+    db.exec(`ALTER TABLE trips ADD COLUMN phase TEXT`);
+  }
+  if (!tripCols.includes('departed_at')) {
+    db.exec(`ALTER TABLE trips ADD COLUMN departed_at TEXT`);
   }
 }
