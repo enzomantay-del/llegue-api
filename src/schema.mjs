@@ -114,6 +114,8 @@ CREATE TABLE IF NOT EXISTS trips (
   created_at TEXT NOT NULL,
   phase TEXT,
   departed_at TEXT,
+  created_by_user_id TEXT,
+  created_by_name TEXT,
   FOREIGN KEY (kid_id) REFERENCES users(id)
 );
 
@@ -220,5 +222,36 @@ CREATE TABLE IF NOT EXISTS account_profiles (
   }
   if (!tripCols.includes('departed_at')) {
     db.exec(`ALTER TABLE trips ADD COLUMN departed_at TEXT`);
+  }
+  if (!tripCols.includes('created_by_user_id')) {
+    db.exec(`ALTER TABLE trips ADD COLUMN created_by_user_id TEXT`);
+  }
+  if (!tripCols.includes('created_by_name')) {
+    db.exec(`ALTER TABLE trips ADD COLUMN created_by_name TEXT`);
+  }
+
+  // Especiales canceladas: si el destino no es casa/colegio ni tiene rutina, dejar de monitorearlo.
+  try {
+    db.exec(`
+      UPDATE places SET status = 'inactive'
+      WHERE status = 'active'
+        AND type NOT IN ('home', 'school')
+        AND id IN (
+          SELECT destination_place_id FROM trips
+          WHERE status = 'cancelled'
+            AND routine_id IS NULL
+            AND destination_place_id IS NOT NULL
+        )
+        AND id NOT IN (
+          SELECT destination_place_id FROM trips
+          WHERE status IN ('active', 'overdue')
+            AND destination_place_id IS NOT NULL
+        )
+        AND id NOT IN (
+          SELECT place_id FROM routines WHERE active = 1
+        )
+    `);
+  } catch {
+    // tablas todavía no existen en installs muy viejas
   }
 }

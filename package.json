@@ -7,6 +7,7 @@
     "dev": "node --experimental-sqlite src/server.mjs",
     "start": "node --experimental-sqlite src/server.mjs",
     "db:init": "node --experimental-sqlite src/db-init.mjs",
-    "db:seed": "node --experimental-sqlite src/seed-familia.mjs"
+    "db:seed": "node --experimental-sqlite src/seed-familia.mjs",
+    "test": "node --experimental-sqlite test/special-trip-cancel.mjs"
   }
 }
