@@ -79,7 +79,23 @@ async function getAccessToken(sa) {
   return cachedAccessToken;
 }
 
-async function sendHttpV1(token, { title, body, urgent }) {
+/** FCM data solo acepta strings. */
+export function buildFcmData({ title, body, urgent = false, data = null }) {
+  const out = {
+    title: String(title ?? ''),
+    body: String(body ?? ''),
+    urgent: urgent ? 'true' : 'false',
+  };
+  if (data && typeof data === 'object') {
+    for (const [key, value] of Object.entries(data)) {
+      if (value == null || value === '') continue;
+      out[key] = String(value);
+    }
+  }
+  return out;
+}
+
+async function sendHttpV1(token, { title, body, urgent, data }) {
   const sa = loadServiceAccount();
   if (!sa?.project_id) return { sent: false, reason: 'no-service-account' };
   const access = await getAccessToken(sa);
@@ -95,11 +111,7 @@ async function sendHttpV1(token, { title, body, urgent }) {
         message: {
           token,
           notification: { title, body },
-          data: {
-            title,
-            body,
-            urgent: urgent ? 'true' : 'false',
-          },
+          data: buildFcmData({ title, body, urgent, data }),
           android: {
             priority: 'high',
             notification: {
@@ -117,7 +129,7 @@ async function sendHttpV1(token, { title, body, urgent }) {
   return { sent: res.ok, detail: json, via: 'http-v1' };
 }
 
-async function sendLegacy(token, { title, body, urgent }) {
+async function sendLegacy(token, { title, body, urgent, data }) {
   const key = process.env.FCM_SERVER_KEY;
   if (!key) return { sent: false, reason: 'no-fcm-key' };
   const res = await fetch('https://fcm.googleapis.com/fcm/send', {
@@ -130,7 +142,7 @@ async function sendLegacy(token, { title, body, urgent }) {
       to: token,
       priority: 'high',
       notification: { title, body, sound: 'default' },
-      data: { title, body, urgent: urgent ? 'true' : 'false' },
+      data: buildFcmData({ title, body, urgent, data }),
       android: {
         priority: 'high',
         notification: {
@@ -144,14 +156,14 @@ async function sendLegacy(token, { title, body, urgent }) {
   return { sent: res.ok && !json.failure, detail: json, via: 'legacy' };
 }
 
-export async function sendPushToToken(token, { title, body, urgent = false }) {
+export async function sendPushToToken(token, { title, body, urgent = false, data = null }) {
   if (!token) return { sent: false, reason: 'no-token' };
   try {
     if (loadServiceAccount()) {
-      return await sendHttpV1(token, { title, body, urgent });
+      return await sendHttpV1(token, { title, body, urgent, data });
     }
     if (process.env.FCM_SERVER_KEY) {
-      return await sendLegacy(token, { title, body, urgent });
+      return await sendLegacy(token, { title, body, urgent, data });
     }
     return { sent: false, reason: 'no-fcm-config' };
   } catch (e) {

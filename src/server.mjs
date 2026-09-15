@@ -354,7 +354,8 @@ function isPlannedSpecialTrip(trip) {
   return Boolean(trip && !trip.routine_id && trip.destination_place_id);
 }
 
-function lookupFamilyPlace(familyId, placeId, placeName) {
+function lookupFamilyPlace(familyId, placeId, placeName, opts = {}) {
+  const includeInactive = opts.includeInactive === true;
   if (placeId) {
     const byId = db
       .prepare(
@@ -367,12 +368,88 @@ function lookupFamilyPlace(familyId, placeId, placeName) {
   if (!name || !familyId) return null;
   const rows = db
     .prepare(
-      `SELECT * FROM places WHERE family_id = ? AND status = 'active'`,
+      includeInactive
+        ? `SELECT * FROM places WHERE family_id = ? AND status != 'deleted'`
+        : `SELECT * FROM places WHERE family_id = ? AND status = 'active'`,
     )
     .all(familyId);
   return (
     rows.find((p) => String(p.name).trim().toLowerCase() === name) ?? null
   );
+}
+
+/** Casa, colegio o lugar con rutina activa: se sigue monitoreando aunque se cancele una especial. */
+function isStandingMonitoredPlace(place) {
+  if (!place) return false;
+  if (place.type === 'home' || place.type === 'school') return true;
+  const routine = db
+    .prepare(`SELECT id FROM routines WHERE place_id = ? AND active = 1 LIMIT 1`)
+    .get(place.id);
+  return Boolean(routine);
+}
+
+function isLiveTrip(trip) {
+  return Boolean(trip && (trip.status === 'active' || trip.status === 'overdue'));
+}
+
+/** Destino de una especial ya cancelada, que no es lugar permanente/rutina. */
+function isCancelledSpecialDestination(place, kidId) {
+  if (!place || !kidId) return false;
+  if (isStandingMonitoredPlace(place)) return false;
+  const live = db
+    .prepare(
+      `SELECT id FROM trips
+       WHERE kid_id = ? AND destination_place_id = ? AND status IN ('active','overdue')
+       LIMIT 1`,
+    )
+    .get(kidId, place.id);
+  if (live) return false;
+  const cancelled = db
+    .prepare(
+      `SELECT id FROM trips
+       WHERE kid_id = ? AND destination_place_id = ?
+         AND status = 'cancelled' AND routine_id IS NULL
+       LIMIT 1`,
+    )
+    .get(kidId, place.id);
+  return Boolean(cancelled);
+}
+
+function retireTripOnlyDestination(place, exceptTripId = null) {
+  if (!place || isStandingMonitoredPlace(place)) return false;
+  const other = db
+    .prepare(
+      `SELECT id FROM trips
+       WHERE destination_place_id = ? AND status IN ('active','overdue')
+         AND (? IS NULL OR id != ?)
+       LIMIT 1`,
+    )
+    .get(place.id, exceptTripId, exceptTripId);
+  if (other) return false;
+  db.prepare(
+    `UPDATE places SET status = 'inactive' WHERE id = ? AND status = 'active'`,
+  ).run(place.id);
+  return true;
+}
+
+function cancelTripRecord(trip) {
+  db.prepare(
+    `UPDATE trips SET status = 'cancelled', ended_at = ?, phase = NULL WHERE id = ?`,
+  ).run(nowIso(), trip.id);
+  if (isPlannedSpecialTrip(trip) && trip.destination_place_id) {
+    const dest = db.prepare('SELECT * FROM places WHERE id = ?').get(trip.destination_place_id);
+    retireTripOnlyDestination(dest, trip.id);
+  }
+  return db.prepare('SELECT * FROM trips WHERE id = ?').get(trip.id);
+}
+
+function stoppedSharingPayload(kid, extra = {}) {
+  const payload = { ...(extra && typeof extra === 'object' ? extra : {}) };
+  payload.type = 'kid_stopped_sharing';
+  payload.kidId = kid.id;
+  if (kid.phone) payload.phone = kid.phone;
+  else delete payload.phone;
+  return payload;
 }
 
 function tripDestinationPlace(trip) {
@@ -442,6 +519,8 @@ function tripPublic(t) {
     createdAt: t.created_at,
     phase: t.phase ?? null,
     departedAt: t.departed_at ?? null,
+    createdByUserId: t.created_by_user_id ?? null,
+    createdByName: t.created_by_name ?? null,
   };
 }
 
@@ -660,17 +739,25 @@ function fanOutNotifications(event, familyId, title, body, excludeUserId = null)
       )
       .get(adult.id);
     if (device?.push_token) {
+      const urgent =
+        title.includes('Ayuda') ||
+        event.type === 'panic' ||
+        event.type === 'location_lost' ||
+        event.type === 'app_closed' ||
+        event.type === 'low_battery' ||
+        event.type === 'delay';
+      const pushData = {};
+      if (event.type === 'location_lost' || event.type === 'app_closed') {
+        const kidRow = db.prepare('SELECT * FROM users WHERE id = ?').get(event.kid_id);
+        Object.assign(pushData, stoppedSharingPayload(kidRow || { id: event.kid_id }));
+        pushData.eventType = event.type;
+      }
       // fire-and-forget
       sendPushToToken(device.push_token, {
         title,
         body,
-        urgent:
-          title.includes('Ayuda') ||
-          event.type === 'panic' ||
-          event.type === 'location_lost' ||
-          event.type === 'app_closed' ||
-          event.type === 'low_battery' ||
-          event.type === 'delay',
+        urgent,
+        data: Object.keys(pushData).length ? pushData : null,
       }).catch(() => {});
     }
   }
@@ -743,12 +830,13 @@ function checkDeviceHealthAlerts() {
       kid,
       type: 'location_lost',
       forceNotify: true,
-      payload: {
+      payload: stoppedSharingPayload(kid, {
         locationPermission: d.location_permission,
         notificationsPermission: d.notifications_permission,
         locationOk: d.location_ok,
         lastSeenAt: d.last_seen_at,
-      },
+        source: 'heartbeat',
+      }),
     });
   }
 }
@@ -771,8 +859,38 @@ function createEvent({
     notify = true;
   }
 
+  if (type === 'location_lost' || type === 'app_closed') {
+    payload = stoppedSharingPayload(kid, payload && typeof payload === 'object' ? payload : {});
+  }
+
+  let resolvedTripId = tripId || null;
+  let providedTrip = resolvedTripId
+    ? db.prepare('SELECT * FROM trips WHERE id = ?').get(resolvedTripId)
+    : null;
+  const providedDeadSpecial =
+    providedTrip && !isLiveTrip(providedTrip) && isPlannedSpecialTrip(providedTrip);
+  if (providedTrip && !isLiveTrip(providedTrip)) {
+    providedTrip = null;
+    resolvedTripId = null;
+  }
+
+  let resolvedPlaceId = placeId;
+  let place = resolvedPlaceId
+    ? db.prepare('SELECT * FROM places WHERE id = ?').get(resolvedPlaceId)
+    : null;
+
+  if (type === 'arrival' || type === 'departure') {
+    const placeGone = place && place.status !== 'active' && place.status !== 'pending_approval';
+    if (placeGone || isCancelledSpecialDestination(place, kid.id)) {
+      return { event: null, notifiedCount: 0, place: null, ignored: true };
+    }
+    // La app puede seguir mandando el tripId cancelado (sin placeId = infería el destino).
+    if (providedDeadSpecial && !isStandingMonitoredPlace(place)) {
+      return { event: null, notifiedCount: 0, place: null, ignored: true };
+    }
+  }
+
   // Salida sin viaje activo → abrimos viaje abierto (sin hora de vuelta)
-  let resolvedTripId = tripId;
   if (type === 'departure' && !resolvedTripId) {
     const existing = db
       .prepare(
@@ -802,11 +920,11 @@ function createEvent({
   let activeTrip = resolvedTripId
     ? db.prepare('SELECT * FROM trips WHERE id = ?').get(resolvedTripId)
     : null;
+  if (activeTrip && !isLiveTrip(activeTrip)) {
+    activeTrip = null;
+    resolvedTripId = null;
+  }
 
-  let resolvedPlaceId = placeId;
-  let place = resolvedPlaceId
-    ? db.prepare('SELECT * FROM places WHERE id = ?').get(resolvedPlaceId)
-    : null;
   if (!place && (type === 'arrival' || type === 'departure')) {
     place = impliedSpecialTripPlace(activeTrip, type, kid.family_id);
     if (place) resolvedPlaceId = place.id;
@@ -1991,7 +2109,7 @@ const server = http.createServer(async (req, res) => {
             kid: user,
             type: 'app_closed',
             forceNotify: true,
-            payload: { source: 'presence', immediate: true },
+            payload: stoppedSharingPayload(user, { source: 'presence', immediate: true }),
           });
         }
       }
@@ -2054,11 +2172,11 @@ const server = http.createServer(async (req, res) => {
             kid: user,
             type: 'location_lost',
             forceNotify: true,
-            payload: {
+            payload: stoppedSharingPayload(user, {
               locationPermission: updated.location_permission,
               locationOk: updated.location_ok,
               source: 'permission_update',
-            },
+            }),
           });
         }
       }
@@ -2084,7 +2202,7 @@ const server = http.createServer(async (req, res) => {
       const rows = db
         .prepare(
           includePending && isAdultRole(user.role)
-            ? `SELECT * FROM places WHERE family_id = ? ORDER BY created_at DESC`
+            ? `SELECT * FROM places WHERE family_id = ? AND status != 'deleted' AND status != 'inactive' ORDER BY created_at DESC`
             : `SELECT * FROM places WHERE family_id = ? AND status = 'active' ORDER BY created_at DESC`,
         )
         .all(user.family_id);
@@ -2468,9 +2586,20 @@ const server = http.createServer(async (req, res) => {
       const phase = dest?.id ? 'pending_departure' : null;
       db.prepare(
         `INSERT INTO trips
-         (id, kid_id, origin_place_id, destination_place_id, status, expected_return_at, started_at, created_at, phase, departed_at)
-         VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL)`,
-      ).run(id, kid.id, home?.id ?? null, dest?.id ?? null, expected, nowIso(), nowIso(), phase);
+         (id, kid_id, origin_place_id, destination_place_id, status, expected_return_at, started_at, created_at, phase, departed_at, created_by_user_id, created_by_name)
+         VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL, ?, ?)`,
+      ).run(
+        id,
+        kid.id,
+        home?.id ?? null,
+        dest?.id ?? null,
+        expected,
+        nowIso(),
+        nowIso(),
+        phase,
+        user.id,
+        user.name,
+      );
       const trip = db.prepare('SELECT * FROM trips WHERE id = ?').get(id);
       // Solo crea el viaje. Cero push familiar de “salió”: el primer aviso es EXIT Casa.
       let notifiedCount = 0;
@@ -2491,7 +2620,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'PATCH' && pathname.startsWith('/trips/')) {
       const user = authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
-      const tripId = pathname.slice('/trips/'.length);
+      const rest = pathname.slice('/trips/'.length);
+      const parts = rest.split('/').filter(Boolean);
+      const tripId = parts[0];
+      const pathAction = parts[1];
       const trip = db.prepare('SELECT * FROM trips WHERE id = ?').get(tripId);
       if (!trip) return send(res, 404, { error: 'No encontramos esa salida.' });
       const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(trip.kid_id);
@@ -2502,10 +2634,17 @@ const server = http.createServer(async (req, res) => {
         return send(res, 403, { error: 'Solo podés cambiar tu salida.' });
       }
       const body = await readBody(req);
-      const action = body.action || body.status;
+      const action = pathAction === 'cancel' ? 'cancel' : body.action || body.status;
       if (action === 'cancel' || action === 'cancelled') {
-        db.prepare(`UPDATE trips SET status = 'cancelled', ended_at = ? WHERE id = ?`).run(nowIso(), tripId);
-        return send(res, 200, { trip: tripPublic(db.prepare('SELECT * FROM trips WHERE id = ?').get(tripId)) });
+        if (trip.status === 'cancelled') {
+          const again = cancelTripRecord(trip);
+          return send(res, 200, { trip: tripPublic(again) });
+        }
+        if (!['active', 'overdue'].includes(trip.status)) {
+          return send(res, 400, { error: 'Esa salida ya terminó.' });
+        }
+        const updated = cancelTripRecord(trip);
+        return send(res, 200, { trip: tripPublic(updated) });
       }
       if (action === 'update' || action === 'edit') {
         if (!['active', 'overdue'].includes(trip.status)) {
@@ -2535,6 +2674,9 @@ const server = http.createServer(async (req, res) => {
         });
       }
       if (action === 'arrive' || action === 'arrived') {
+        if (!['active', 'overdue'].includes(trip.status)) {
+          return send(res, 400, { error: 'Esa salida ya terminó.' });
+        }
         const { event, notifiedCount } = createEvent({
           kid,
           type: 'arrival',
@@ -2600,7 +2742,9 @@ const server = http.createServer(async (req, res) => {
         payloadIn.place_name ??
         null;
       if (placeId || placeName) {
-        const found = lookupFamilyPlace(user.family_id, placeId, placeName);
+        const found = lookupFamilyPlace(user.family_id, placeId, placeName, {
+          includeInactive: type === 'arrival' || type === 'departure',
+        });
         if (found) {
           placeId = found.id;
         } else if (placeId && (type === 'arrival' || type === 'departure')) {
