@@ -354,6 +354,84 @@ function isPlannedSpecialTrip(trip) {
   return Boolean(trip && !trip.routine_id && trip.destination_place_id);
 }
 
+function isLiveTrip(trip) {
+  return Boolean(trip && (trip.status === 'active' || trip.status === 'overdue'));
+}
+
+function distanceM(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
+function coordsFromBody(body) {
+  if (!body || typeof body !== 'object') return null;
+  const loc = body.location && typeof body.location === 'object' ? body.location : null;
+  const lat = Number(body.lat ?? body.latitude ?? loc?.lat ?? loc?.latitude);
+  const lng = Number(body.lng ?? body.longitude ?? loc?.lng ?? loc?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+  return { lat, lng };
+}
+
+function insidePlace(lat, lng, place) {
+  if (!place || !Number.isFinite(Number(place.lat)) || !Number.isFinite(Number(place.lng))) {
+    return false;
+  }
+  const radius = Number(place.radius_m) > 0 ? Number(place.radius_m) : 60;
+  return distanceM(lat, lng, place.lat, place.lng) <= radius;
+}
+
+function specialTripLeftHome(trip) {
+  if (!trip) return false;
+  if (trip.departed_at) return true;
+  const phase = trip.phase || '';
+  return phase === 'en_route' || phase === 'at_destination' || phase === 'returning';
+}
+
+function specialTripHeadingOut(trip) {
+  if (!isPlannedSpecialTrip(trip) || !isLiveTrip(trip)) return false;
+  const phase = trip.phase || '';
+  if (phase === 'at_destination' || phase === 'returning') return false;
+  if (phase === 'en_route') return true;
+  return specialTripLeftHome(trip);
+}
+
+function specialTripHeadingHome(trip) {
+  if (!isPlannedSpecialTrip(trip) || !isLiveTrip(trip)) return false;
+  const phase = trip.phase || '';
+  return phase === 'at_destination' || phase === 'returning';
+}
+
+function liveKidTrip(kidId) {
+  return db
+    .prepare(
+      `SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC LIMIT 1`,
+    )
+    .get(kidId);
+}
+
+function matchSpecialGeofencePlace(trip, familyId, lat, lng) {
+  if (!isPlannedSpecialTrip(trip) || !isLiveTrip(trip)) return null;
+  const dest = tripDestinationPlace(trip);
+  const home = familyHomePlace(familyId);
+  const inDest = dest && insidePlace(lat, lng, dest);
+  const inHome = home && insidePlace(lat, lng, home);
+  if (inDest && inHome) {
+    if (specialTripHeadingOut(trip)) return dest;
+    if (specialTripHeadingHome(trip)) return home;
+    return dest;
+  }
+  if (inDest) return dest;
+  if (inHome && specialTripHeadingHome(trip)) return home;
+  return null;
+}
+
 function lookupFamilyPlace(familyId, placeId, placeName, opts = {}) {
   const includeInactive = opts.includeInactive === true;
   if (placeId) {
@@ -386,10 +464,6 @@ function isStandingMonitoredPlace(place) {
     .prepare(`SELECT id FROM routines WHERE place_id = ? AND active = 1 LIMIT 1`)
     .get(place.id);
   return Boolean(routine);
-}
-
-function isLiveTrip(trip) {
-  return Boolean(trip && (trip.status === 'active' || trip.status === 'overdue'));
 }
 
 /** Destino de una especial ya cancelada, que no es lugar permanente/rutina. */
@@ -470,20 +544,19 @@ function placeMatchesTripDestination(place, trip) {
 
 /** Si el celular manda arrival/departure sin placeId, inferir Casa vs destino según la fase. */
 function impliedSpecialTripPlace(trip, type, familyId) {
-  if (!isPlannedSpecialTrip(trip)) return null;
+  if (!isPlannedSpecialTrip(trip) || !isLiveTrip(trip)) return null;
   const dest = tripDestinationPlace(trip);
   if (!dest) return null;
   const home = familyHomePlace(familyId);
-  const phase = trip.phase || '';
-  const headingOut =
-    phase === 'pending_departure' || phase === 'en_route' || phase === '';
-  const headingHome = phase === 'at_destination' || phase === 'returning';
+  const headingOut = specialTripHeadingOut(trip);
+  const headingHome = specialTripHeadingHome(trip);
   if (type === 'arrival') {
     if (headingHome && dest.type !== 'home') return home;
+    // en_route, o pending ya después de EXIT Casa.
     if (headingOut) return dest;
   }
   if (type === 'departure') {
-    if (headingOut) return home;
+    if (headingOut || trip.phase === 'pending_departure' || !trip.phase) return home;
     if (headingHome) return dest;
   }
   return null;
@@ -506,6 +579,7 @@ function placePublic(p) {
 }
 
 function tripPublic(t) {
+  const dest = tripDestinationPlace(t);
   return {
     id: t.id,
     kidId: t.kid_id,
@@ -521,7 +595,167 @@ function tripPublic(t) {
     departedAt: t.departed_at ?? null,
     createdByUserId: t.created_by_user_id ?? null,
     createdByName: t.created_by_name ?? null,
+    destination: dest ? placePublic(dest) : null,
+    destinationName: dest?.name ?? null,
+    destinationType: dest?.type ?? null,
+    destinationLat: dest?.lat ?? null,
+    destinationLng: dest?.lng ?? null,
+    destinationRadiusM: dest?.radius_m ?? null,
   };
+}
+
+function monitorGeofencesForKid(kid) {
+  if (!kid?.family_id) return [];
+  const out = [];
+  const seen = new Set();
+  const add = (place, reason, tripId = null) => {
+    if (!place || seen.has(place.id)) return;
+    seen.add(place.id);
+    out.push({ ...placePublic(place), reason, tripId });
+  };
+  add(familyHomePlace(kid.family_id), 'home');
+  const trip = liveKidTrip(kid.id);
+  if (isPlannedSpecialTrip(trip) && isLiveTrip(trip)) {
+    add(tripDestinationPlace(trip), 'special_trip_destination', trip.id);
+  }
+  return out;
+}
+
+function resolveOrCreateTripDestination(user, body) {
+  const nested = body.destination && typeof body.destination === 'object' ? body.destination : {};
+  const placeId =
+    body.destinationPlaceId ||
+    nested.id ||
+    nested.placeId ||
+    body.destination_place_id ||
+    null;
+  if (placeId) {
+    const dest = db
+      .prepare(`SELECT * FROM places WHERE id = ? AND family_id = ? AND status = 'active'`)
+      .get(placeId, user.family_id);
+    if (dest) return dest;
+  }
+  const name = String(
+    body.destinationName ?? nested.name ?? body.placeName ?? '',
+  ).trim();
+  const lat = Number(body.destinationLat ?? nested.lat ?? body.lat);
+  const lng = Number(body.destinationLng ?? nested.lng ?? body.lng);
+  if (name.length < 2 || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+  const radiusRaw = Number(body.destinationRadiusM ?? nested.radiusM ?? nested.radius_m ?? body.radiusM);
+  const radius = radiusRaw > 0 ? Math.min(radiusRaw, 500) : 120;
+  const nearby = db
+    .prepare(`SELECT * FROM places WHERE family_id = ? AND status = 'active'`)
+    .all(user.family_id)
+    .find(
+      (p) =>
+        String(p.name).trim().toLowerCase() === name.toLowerCase() &&
+        distanceM(lat, lng, p.lat, p.lng) <= 40,
+    );
+  if (nearby) return nearby;
+  const id = uuid();
+  db.prepare(
+    `INSERT INTO places
+     (id, family_id, created_by_user_id, name, lat, lng, radius_m, type, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'special', 'active', ?)`,
+  ).run(id, user.family_id, user.id, name, lat, lng, radius, nowIso());
+  return db.prepare('SELECT * FROM places WHERE id = ?').get(id);
+}
+
+function applySpecialTripGeofence(activeTrip, type, place) {
+  if (!activeTrip || !isLiveTrip(activeTrip)) return;
+  if (type === 'arrival') {
+    const arrivedHome = place?.type === 'home';
+    const arrivedAtDest = placeMatchesTripDestination(place, activeTrip);
+    if (isPlannedSpecialTrip(activeTrip)) {
+      if (arrivedHome && !specialTripLeftHome(activeTrip)) {
+        return;
+      }
+      if (arrivedAtDest && !arrivedHome) {
+        db.prepare(
+          `UPDATE trips SET phase = 'at_destination', departed_at = COALESCE(departed_at, ?) WHERE id = ? AND status IN ('active','overdue')`,
+        ).run(nowIso(), activeTrip.id);
+        return;
+      }
+      if (arrivedHome) {
+        db.prepare(
+          `UPDATE trips SET status = 'arrived', ended_at = ? WHERE id = ? AND status IN ('active','overdue')`,
+        ).run(nowIso(), activeTrip.id);
+      }
+      return;
+    }
+    db.prepare(
+      `UPDATE trips SET status = 'arrived', ended_at = ? WHERE id = ? AND status IN ('active','overdue')`,
+    ).run(nowIso(), activeTrip.id);
+    return;
+  }
+  if (type === 'departure' && isPlannedSpecialTrip(activeTrip)) {
+    const now = nowIso();
+    if (place?.type === 'home') {
+      db.prepare(
+        `UPDATE trips SET phase = 'en_route', departed_at = COALESCE(departed_at, ?) WHERE id = ? AND status IN ('active','overdue')`,
+      ).run(now, activeTrip.id);
+    } else if (placeMatchesTripDestination(place, activeTrip)) {
+      db.prepare(
+        `UPDATE trips SET phase = 'returning' WHERE id = ? AND status IN ('active','overdue')`,
+      ).run(activeTrip.id);
+    }
+  }
+}
+
+function applyKidLocation(kid, lat, lng, deviceId) {
+  if (!kid || kid.role !== 'kid' || !deviceId) return { events: [] };
+  const device = db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(deviceId, kid.id);
+  if (!device) return { events: [] };
+
+  const trip = liveKidTrip(kid.id);
+  const home = familyHomePlace(kid.family_id);
+  const dest = isPlannedSpecialTrip(trip) ? tripDestinationPlace(trip) : null;
+  const inHome = Boolean(home && insidePlace(lat, lng, home));
+  const inDest = Boolean(dest && insidePlace(lat, lng, dest));
+
+  let nowPlaceId = null;
+  if (inDest && inHome) {
+    nowPlaceId = specialTripHeadingOut(trip) ? dest.id : home.id;
+  } else if (inDest) {
+    nowPlaceId = dest.id;
+  } else if (inHome) {
+    nowPlaceId = home.id;
+  }
+
+  const firstFix = device.last_lat == null && device.last_lng == null;
+  const prevPlaceId = device.last_inside_place_id || null;
+
+  db.prepare(
+    `UPDATE devices SET last_lat = ?, last_lng = ?, last_inside_place_id = ?, last_seen_at = ? WHERE id = ?`,
+  ).run(lat, lng, nowPlaceId, nowIso(), device.id);
+
+  // Primer GPS en casa: no inventar "llegó a Casa" al armar la especial.
+  if (firstFix && inHome && !inDest) {
+    return { events: [] };
+  }
+
+  const events = [];
+  if (prevPlaceId && prevPlaceId !== nowPlaceId) {
+    const left = createEvent({
+      kid,
+      type: 'departure',
+      placeId: prevPlaceId,
+      tripId: trip?.id ?? null,
+    });
+    if (left?.event && !left.ignored) events.push(left);
+  }
+  if (nowPlaceId && nowPlaceId !== prevPlaceId) {
+    const entered = createEvent({
+      kid,
+      type: 'arrival',
+      placeId: nowPlaceId,
+      tripId: trip?.id ?? null,
+    });
+    if (entered?.event && !entered.ignored) events.push(entered);
+  }
+  return { events };
 }
 
 function eventPublic(e) {
@@ -765,7 +999,7 @@ function fanOutNotifications(event, familyId, title, body, excludeUserId = null)
 }
 
 /** Aviso directo a un hijo/a (solo aceptaciones del adulto). */
-function notifyKidUser(kidId, title, body, eventId = null) {
+function notifyKidUser(kidId, title, body, eventId = null, data = null) {
   if (!kidId) return 0;
   const kid = db.prepare(`SELECT * FROM users WHERE id = ? AND role = 'kid'`).get(kidId);
   if (!kid) return 0;
@@ -790,7 +1024,7 @@ function notifyKidUser(kidId, title, body, eventId = null) {
     )
     .get(kid.id);
   if (device?.push_token) {
-    sendPushToToken(device.push_token, { title, body }).catch(() => {});
+    sendPushToToken(device.push_token, { title, body, data }).catch(() => {});
   }
   return 1;
 }
@@ -930,6 +1164,17 @@ function createEvent({
     if (place) resolvedPlaceId = place.id;
   }
 
+  // Casa ENTER mientras la especial todavía no salió: no avisar ni cerrar.
+  if (
+    type === 'arrival' &&
+    isPlannedSpecialTrip(activeTrip) &&
+    place?.type === 'home' &&
+    !specialTripLeftHome(activeTrip)
+  ) {
+    applySpecialTripGeofence(activeTrip, type, place);
+    return { event: null, notifiedCount: 0, place: placePublic(place), ignored: true };
+  }
+
   // Anti-duplicados: mismo tipo+lugar en los últimos 90s (después de resolver el lugar)
   const since = new Date(Date.now() - 90 * 1000).toISOString();
   const dup = db
@@ -941,6 +1186,7 @@ function createEvent({
     )
     .get(kid.id, type, since, resolvedPlaceId, resolvedPlaceId);
   if (dup && type !== 'panic' && type !== 'im_ok') {
+    applySpecialTripGeofence(activeTrip, type, place);
     return {
       event: eventPublic(dup),
       notifiedCount: 0,
@@ -973,39 +1219,13 @@ function createEvent({
   );
   const event = db.prepare('SELECT * FROM events WHERE id = ?').get(id);
 
-  if (type === 'arrival') {
+  applySpecialTripGeofence(activeTrip, type, place);
+  if (type === 'arrival' && !isPlannedSpecialTrip(activeTrip)) {
     const arrivedHome = place?.type === 'home';
-    const arrivedAtDest = placeMatchesTripDestination(place, activeTrip);
-    // Salida especial (super, etc.): ENTER destino NO cierra; ENTER Casa sí.
-    // Viajes abiertos por rutina/departure: cualquier llegada cierra (igual que antes).
-    const shouldClose =
-      !isPlannedSpecialTrip(activeTrip) || arrivedHome;
-    if (shouldClose) {
-      if (resolvedTripId) {
-        db.prepare(
-          `UPDATE trips SET status = 'arrived', ended_at = ? WHERE id = ? AND status IN ('active','overdue')`,
-        ).run(nowIso(), resolvedTripId);
-      } else {
-        db.prepare(
-          `UPDATE trips SET status = 'arrived', ended_at = ? WHERE kid_id = ? AND status IN ('active','overdue')`,
-        ).run(nowIso(), kid.id);
-      }
-    } else if (arrivedAtDest && activeTrip) {
-      db.prepare(`UPDATE trips SET phase = 'at_destination' WHERE id = ?`).run(
-        activeTrip.id,
-      );
-    }
-  }
-  if (type === 'departure' && activeTrip && isPlannedSpecialTrip(activeTrip)) {
-    const now = nowIso();
-    if (place?.type === 'home') {
+    if (!activeTrip && (arrivedHome || place)) {
       db.prepare(
-        `UPDATE trips SET phase = 'en_route', departed_at = COALESCE(departed_at, ?) WHERE id = ? AND status IN ('active','overdue')`,
-      ).run(now, activeTrip.id);
-    } else if (placeMatchesTripDestination(place, activeTrip)) {
-      db.prepare(
-        `UPDATE trips SET phase = 'returning' WHERE id = ? AND status IN ('active','overdue')`,
-      ).run(activeTrip.id);
+        `UPDATE trips SET status = 'arrived', ended_at = ? WHERE kid_id = ? AND status IN ('active','overdue')`,
+      ).run(nowIso(), kid.id);
     }
   }
   if (type === 'im_ok') {
@@ -2058,13 +2278,19 @@ const server = http.createServer(async (req, res) => {
           });
         }
       }
+      const geoBatt = coordsFromBody(body);
+      let locationEvents = [];
+      if (geoBatt && user.role === 'kid') {
+        locationEvents = applyKidLocation(user, geoBatt.lat, geoBatt.lng, device.id).events;
+      }
       return send(res, 200, {
         device: {
           id: device.id,
           batteryLevel: device.battery_level,
           lastSeenAt: device.last_seen_at,
         },
-        event: eventResult?.event ?? null,
+        event: eventResult?.event ?? locationEvents[0]?.event ?? null,
+        locationEvents: locationEvents.map((e) => e.event),
       });
     }
 
@@ -2088,6 +2314,12 @@ const server = http.createServer(async (req, res) => {
       db.prepare(
         `UPDATE devices SET app_state = ?, app_background_at = ?, last_seen_at = ? WHERE id = ?`,
       ).run(state, bgAt, nowIso(), device.id);
+
+      const geo = coordsFromBody(body);
+      let locationEvents = [];
+      if (geo && user.role === 'kid') {
+        locationEvents = applyKidLocation(user, geo.lat, geo.lng, device.id).events;
+      }
 
       let eventResult = null;
       // Solo “cerró la app” si el celular lo confirma de verdad (proceso terminado),
@@ -2116,7 +2348,40 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok: true,
         appState: state,
-        event: eventResult?.event ?? null,
+        event: eventResult?.event ?? locationEvents[0]?.event ?? null,
+        locationEvents: locationEvents.map((e) => e.event),
+      });
+    }
+
+    if (req.method === 'PATCH' && pathname === '/devices/me/location') {
+      const user = authUser(req);
+      if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
+      const body = await readBody(req);
+      const geo = coordsFromBody(body);
+      if (!geo) return send(res, 400, { error: 'Falta la ubicación (lat/lng).' });
+      let device = body.deviceId
+        ? db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
+        : db
+            .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
+            .get(user.id);
+      if (!device) {
+        return send(res, 404, { error: 'No encontramos este celular.' });
+      }
+      let locationEvents = [];
+      if (user.role === 'kid') {
+        locationEvents = applyKidLocation(user, geo.lat, geo.lng, device.id).events;
+      } else {
+        db.prepare(
+          `UPDATE devices SET last_lat = ?, last_lng = ?, last_seen_at = ? WHERE id = ?`,
+        ).run(geo.lat, geo.lng, nowIso(), device.id);
+      }
+      const trip =
+        user.role === 'kid' ? liveKidTrip(user.id) : null;
+      return send(res, 200, {
+        ok: true,
+        events: locationEvents.map((e) => e.event),
+        trip: trip ? tripPublic(trip) : null,
+        geofences: user.role === 'kid' ? monitorGeofencesForKid(user) : [],
       });
     }
 
@@ -2224,7 +2489,7 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: 'Falta la ubicación del lugar.' });
       }
       const id = uuid();
-      const type = ['home', 'school', 'activity', 'favorite'].includes(body.type)
+      const type = ['home', 'school', 'activity', 'favorite', 'special'].includes(body.type)
         ? body.type
         : 'favorite';
       const radius = Number(body.radiusM) > 0 ? Math.min(Number(body.radiusM), 500) : 60;
@@ -2328,7 +2593,7 @@ const server = http.createServer(async (req, res) => {
       const name = body.name != null ? String(body.name).trim() : place.name;
       const lat = body.lat != null ? Number(body.lat) : place.lat;
       const lng = body.lng != null ? Number(body.lng) : place.lng;
-      const type = ['home', 'school', 'activity', 'favorite'].includes(body.type)
+      const type = ['home', 'school', 'activity', 'favorite', 'special'].includes(body.type)
         ? body.type
         : place.type;
       const radius =
@@ -2552,7 +2817,10 @@ const server = http.createServer(async (req, res) => {
       const trip = db
         .prepare(`SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC LIMIT 1`)
         .get(kidId);
-      return send(res, 200, { trip: trip ? tripPublic(trip) : null });
+      return send(res, 200, {
+        trip: trip ? tripPublic(trip) : null,
+        geofences: monitorGeofencesForKid(kid),
+      });
     }
 
     if (req.method === 'POST' && pathname === '/trips') {
@@ -2573,12 +2841,9 @@ const server = http.createServer(async (req, res) => {
       if (existing) {
         return send(res, 400, { error: 'Ya hay una salida en curso. Primero marcá que llegaste.' });
       }
-      let dest = null;
-      if (body.destinationPlaceId) {
-        dest = db
-          .prepare(`SELECT * FROM places WHERE id = ? AND family_id = ? AND status = 'active'`)
-          .get(body.destinationPlaceId, user.family_id);
-        if (!dest) return send(res, 404, { error: 'Ese lugar no está disponible.' });
+      let dest = resolveOrCreateTripDestination(user, body);
+      if (body.destinationPlaceId && !dest) {
+        return send(res, 404, { error: 'Ese lugar no está disponible.' });
       }
       const id = uuid();
       const expected = body.expectedReturnAt ? String(body.expectedReturnAt) : null;
@@ -2612,6 +2877,18 @@ const server = http.createServer(async (req, res) => {
           destIsHome || String(body.kind ?? '') === 'walking_home'
             ? 'Te armaron un regreso a casa'
             : `Te armaron una salida especial${destLabel}`,
+          null,
+          dest
+            ? {
+                type: 'special_trip_created',
+                tripId: id,
+                destinationPlaceId: dest.id,
+                destinationName: dest.name,
+                destinationLat: dest.lat,
+                destinationLng: dest.lng,
+                destinationRadiusM: dest.radius_m,
+              }
+            : { type: 'special_trip_created', tripId: id },
         );
       }
       return send(res, 201, { trip: tripPublic(trip), event: null, notifiedCount });
@@ -2761,6 +3038,15 @@ const server = http.createServer(async (req, res) => {
           .prepare(`SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue')`)
           .get(kid.id);
         tripId = active?.id ?? null;
+      }
+
+      const geo = coordsFromBody(body) || coordsFromBody(payloadIn);
+      if (!placeId && geo && (type === 'arrival' || type === 'departure')) {
+        const tripRow = tripId
+          ? db.prepare('SELECT * FROM trips WHERE id = ?').get(tripId)
+          : liveKidTrip(kid.id);
+        const matched = matchSpecialGeofencePlace(tripRow, kid.family_id, geo.lat, geo.lng);
+        if (matched) placeId = matched.id;
       }
 
       const result = createEvent({
@@ -2928,6 +3214,16 @@ const server = http.createServer(async (req, res) => {
         members,
         places,
         pendingPlaces,
+        geofences:
+          user.role === 'kid'
+            ? monitorGeofencesForKid(user)
+            : db
+                .prepare(`SELECT id FROM users WHERE family_id = ? AND role = 'kid'`)
+                .all(user.family_id)
+                .flatMap((k) => {
+                  const kidRow = db.prepare('SELECT * FROM users WHERE id = ?').get(k.id);
+                  return monitorGeofencesForKid(kidRow);
+                }),
         recentEvents: isAdultRole(user.role) ? recentEvents : [],
         notifications: myNotifications,
       });

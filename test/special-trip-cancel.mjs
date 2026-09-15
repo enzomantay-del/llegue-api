@@ -261,6 +261,98 @@ async function run() {
     });
     assert(done.json.trip == null, 'especial se cierra al volver a casa');
 
+    // Destino inline (como la app arma Super) + geocerca en el trip
+    const superTrip = await api(base, 'POST', '/trips', {
+      token: adultTok,
+      body: {
+        kidId: 'seed-kid-mateo',
+        destination: { name: 'Super', lat: -27.06, lng: -55.25 },
+      },
+    });
+    assert(superTrip.status === 201, `trip Super: ${JSON.stringify(superTrip.json)}`);
+    assert(superTrip.json.trip.destinationPlaceId, 'destino persistido');
+    assert(superTrip.json.trip.destinationName === 'Super', 'destinationName');
+    assert(superTrip.json.trip.destinationLat === -27.06, 'destinationLat para geocerca');
+    assert(superTrip.json.trip.phase === 'pending_departure', 'pending al crear');
+    const kidStatus = await api(base, 'GET', '/family/status', { token: kidTok });
+    const geoNames = (kidStatus.json.geofences || []).map((g) => g.name);
+    assert(geoNames.includes('Casa'), `geofences casa: ${geoNames}`);
+    assert(geoNames.includes('Super'), `geofences dest: ${geoNames}`);
+    const activeGeo = await api(base, 'GET', '/trips/active?kidId=seed-kid-mateo', {
+      token: kidTok,
+    });
+    assert(
+      (activeGeo.json.geofences || []).some((g) => g.reason === 'special_trip_destination'),
+      'trips/active expone geocerca del destino',
+    );
+
+    const depForInfer = await api(base, 'POST', '/events', {
+      token: kidTok,
+      body: { type: 'departure', placeId: 'seed-place-casa', tripId: superTrip.json.trip.id },
+    });
+    assert(depForInfer.json.event?.type === 'departure', 'EXIT Casa');
+    const arrivedNoPlace = await api(base, 'POST', '/events', {
+      token: kidTok,
+      body: { type: 'arrival', tripId: superTrip.json.trip.id },
+    });
+    assert(
+      arrivedNoPlace.json.event?.message?.includes('Super'),
+      `arrival sin placeId en_route → Super, fue ${arrivedNoPlace.json.event?.message}`,
+    );
+    const liveSuper = await api(base, 'GET', '/trips/active?kidId=seed-kid-mateo', {
+      token: adultTok,
+    });
+    assert(liveSuper.json.trip?.status === 'active', 'llegar a Super no cierra');
+    assert(liveSuper.json.trip?.phase === 'at_destination', `fase ${liveSuper.json.trip?.phase}`);
+    await api(base, 'POST', '/events', {
+      token: kidTok,
+      body: { type: 'arrival', placeId: 'seed-place-casa', tripId: superTrip.json.trip.id },
+    });
+
+    const ping = async (lat, lng) =>
+      api(base, 'PATCH', '/devices/me/location', {
+        token: kidTok,
+        body: { lat, lng, deviceId: kid.deviceId },
+      });
+
+    const gpsTrip = await api(base, 'POST', '/trips', {
+      token: adultTok,
+      body: {
+        kidId: 'seed-kid-mateo',
+        destination: { name: 'Super', lat: -27.06, lng: -55.25 },
+      },
+    });
+    assert(gpsTrip.status === 201, `trip GPS Super: ${JSON.stringify(gpsTrip.json)}`);
+    const atHome = await ping(-27.0433, -55.2269);
+    assert(atHome.status === 200, `ping casa: ${JSON.stringify(atHome.json)}`);
+    assert((atHome.json.events || []).length === 0, 'primer GPS en casa no avisa llegada');
+
+    const atSuper = await ping(-27.06, -55.25);
+    assert(atSuper.status === 200, `ping Super: ${JSON.stringify(atSuper.json)}`);
+    const superTypes = (atSuper.json.events || []).map((e) => `${e.type}:${e.message}`);
+    assert(
+      superTypes.some((t) => t.includes('departure') && t.includes('Casa')),
+      `debe avisar salida de Casa: ${superTypes}`,
+    );
+    assert(
+      superTypes.some((t) => t.includes('arrival') && t.includes('Super')),
+      `debe avisar llegó a Super: ${superTypes}`,
+    );
+    assert(atSuper.json.trip?.status === 'active', 'no cierra al llegar al Super');
+    assert(
+      atSuper.json.trip?.phase === 'at_destination',
+      `fase en Super: ${atSuper.json.trip?.phase}`,
+    );
+    const backHome = await ping(-27.0433, -55.2269);
+    assert(
+      (backHome.json.events || []).some((e) => e.type === 'arrival' && e.message.includes('Casa')),
+      `vuelta a Casa: ${(backHome.json.events || []).map((e) => e.message)}`,
+    );
+    const afterGps = await api(base, 'GET', '/trips/active?kidId=seed-kid-mateo', {
+      token: adultTok,
+    });
+    assert(afterGps.json.trip == null, 'GPS: volver a Casa cierra la especial');
+
     const closed = await api(base, 'PATCH', '/devices/me/presence', {
       token: kidTok,
       body: { state: 'background', immediate: true, deviceId: kid.deviceId },
@@ -272,7 +364,7 @@ async function run() {
     assert(closedEvent?.payload?.kidId === 'seed-kid-mateo', 'payload kidId');
     assert(closedEvent?.payload?.phone === '5493743489328', 'payload phone');
 
-    console.log('ok: cancel, creador, kid_stopped_sharing, ciclo Casa→destino→Casa');
+    console.log('ok: cancel, creador, kid_stopped_sharing, ciclo Casa→destino→Casa, GPS Super');
   } finally {
     child.kill('SIGTERM');
     await new Promise((r) => setTimeout(r, 200));
