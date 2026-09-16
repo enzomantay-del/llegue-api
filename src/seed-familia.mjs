@@ -34,10 +34,10 @@ export function loadFamiliaConfig() {
 }
 
 /**
- * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{ prepare: Function, dialect?: string }} db
  * @param {{ forcePin?: boolean }} [opts]
  */
-export function seedFamilia(db, opts = {}) {
+export async function seedFamilia(db, opts = {}) {
   const cfg = loadFamiliaConfig();
   const family = cfg.family;
   const adult = cfg.adult;
@@ -52,18 +52,18 @@ export function seedFamilia(db, opts = {}) {
     );
   }
 
-  const existingFamily = db.prepare('SELECT id FROM families WHERE id = ?').get(family.id);
+  const existingFamily = await db.prepare('SELECT id FROM families WHERE id = ?').get(family.id);
   if (existingFamily) {
-    db.prepare('UPDATE families SET name = ? WHERE id = ?').run(family.name, family.id);
+    await db.prepare('UPDATE families SET name = ? WHERE id = ?').run(family.name, family.id);
   } else {
-    db.prepare('INSERT INTO families (id, name, created_at) VALUES (?, ?, ?)').run(
+    await db.prepare('INSERT INTO families (id, name, created_at) VALUES (?, ?, ?)').run(
       family.id,
       family.name,
       nowIso(),
     );
   }
 
-  upsertUser(db, {
+  await upsertUser(db, {
     id: adult.id,
     familyId: family.id,
     role: 'admin_adult',
@@ -73,13 +73,13 @@ export function seedFamilia(db, opts = {}) {
     pinHash: null,
   });
 
-  const kidRow = db.prepare('SELECT pin_hash FROM users WHERE id = ?').get(kid.id);
+  const kidRow = await db.prepare('SELECT pin_hash FROM users WHERE id = ?').get(kid.id);
   let pinHash = kidRow?.pin_hash ?? null;
   if (!pinHash || opts.forcePin) {
     pinHash = hashPin(kid.pin || '1234');
   }
 
-  upsertUser(db, {
+  await upsertUser(db, {
     id: kid.id,
     familyId: family.id,
     role: 'kid',
@@ -90,15 +90,15 @@ export function seedFamilia(db, opts = {}) {
   });
 
   for (const place of places) {
-    const row = db.prepare('SELECT id FROM places WHERE id = ?').get(place.id);
+    const row = await db.prepare('SELECT id FROM places WHERE id = ?').get(place.id);
     const radius = Number(place.radiusM) > 0 ? Number(place.radiusM) : 120;
     if (row) {
-      db.prepare(
+      await db.prepare(
         `UPDATE places SET name = ?, lat = ?, lng = ?, radius_m = ?, type = ?, status = 'active'
          WHERE id = ?`,
       ).run(place.name, place.lat, place.lng, radius, place.type || 'favorite', place.id);
     } else {
-      db.prepare(
+      await db.prepare(
         `INSERT INTO places
          (id, family_id, created_by_user_id, name, lat, lng, radius_m, type, status, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
@@ -127,15 +127,15 @@ export function seedFamilia(db, opts = {}) {
   };
 }
 
-function upsertUser(db, u) {
-  const byId = db.prepare('SELECT id FROM users WHERE id = ?').get(u.id);
-  const byPhone = db.prepare('SELECT id FROM users WHERE phone = ?').get(u.phone);
+async function upsertUser(db, u) {
+  const byId = await db.prepare('SELECT id FROM users WHERE id = ?').get(u.id);
+  const byPhone = await db.prepare('SELECT id FROM users WHERE phone = ?').get(u.phone);
   if (byPhone && byPhone.id !== u.id) {
     // Liberar teléfono de otro usuario de prueba
-    db.prepare('UPDATE users SET phone = NULL WHERE id = ?').run(byPhone.id);
+    await db.prepare('UPDATE users SET phone = NULL WHERE id = ?').run(byPhone.id);
   }
   if (byId) {
-    db.prepare(
+    await db.prepare(
       `UPDATE users SET family_id = ?, role = ?, name = ?, phone = ?,
        relationship_label = ?, pin_hash = COALESCE(?, pin_hash) WHERE id = ?`,
     ).run(
@@ -148,7 +148,7 @@ function upsertUser(db, u) {
       u.id,
     );
   } else {
-    db.prepare(
+    await db.prepare(
       `INSERT INTO users
        (id, family_id, role, name, phone, pin_hash, relationship_label, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -167,19 +167,16 @@ function upsertUser(db, u) {
 
 // CLI: node --experimental-sqlite src/seed-familia.mjs
 if (process.argv[1] && path.normalize(process.argv[1]).endsWith('seed-familia.mjs')) {
-  const { DatabaseSync } = await import('node:sqlite');
+  const { openDatabase } = await import('./db.mjs');
   const { ensureSchema } = await import('./schema.mjs');
-  const dataDir = path.join(root, 'data');
-  fs.mkdirSync(dataDir, { recursive: true });
-  const dbPath = path.join(dataDir, 'llegue.db');
-  const db = new DatabaseSync(dbPath);
-  ensureSchema(db);
-  const info = seedFamilia(db, { forcePin: true });
+  const db = await openDatabase();
+  await ensureSchema(db);
+  const info = await seedFamilia(db, { forcePin: true });
   console.log('Familia lista:');
   console.log(`  ${info.familyName}`);
   console.log(`  Adulto: ${info.adultName} · tel ${info.adultPhone}`);
   console.log(`  Hijo/a: ${info.kidName} · tel ${info.kidPhone} · PIN ${info.kidPin}`);
   console.log(`  Lugares: ${info.places.join(', ')}`);
   console.log('OTP de prueba: 123456');
-  db.close();
+  await db.close();
 }

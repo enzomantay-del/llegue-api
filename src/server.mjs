@@ -3,16 +3,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
+import { assertProdJwtSecrets, openDatabase } from './db.mjs';
 import { ensureSchema } from './schema.mjs';
 import { sendPushToToken } from './push.mjs';
 import { seedFamilia } from './seed-familia.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
-const dataDir = path.join(root, 'data');
-const dbPath = process.env.LLEGUE_DB_PATH || path.join(dataDir, 'llegue.db');
-fs.mkdirSync(dataDir, { recursive: true });
 
 // Cargar .env simple
 const envPath = path.join(root, '.env');
@@ -26,26 +23,17 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-const db = new DatabaseSync(dbPath);
-ensureSchema(db);
+assertProdJwtSecrets();
 
+let db;
 let seedInfo = null;
-try {
-  if ((process.env.SEED_FAMILIA ?? 'false') === 'true') {
-    seedInfo = seedFamilia(db);
-    console.log(
-      `Seed familia: ${seedInfo.familyName} · ` +
-        `${seedInfo.adultName} (${seedInfo.adultPhone}) · ` +
-        `${seedInfo.kidName} (${seedInfo.kidPhone})`,
-    );
-  }
-} catch (e) {
-  console.error('Seed familia falló:', e.message || e);
-}
 
 const PORT = Number(process.env.PORT ?? 8787);
 const JWT_SECRET = process.env.JWT_SECRET ?? 'llegue-dev-secret';
 const JWT_REFRESH = process.env.JWT_REFRESH_SECRET ?? 'llegue-dev-refresh';
+/** Access corto; el refresh (60 días) mantiene la sesión tras días sin abrir la app. */
+const ACCESS_TTL_SEC = Number(process.env.ACCESS_TTL_SEC ?? 7 * 24 * 60 * 60);
+const REFRESH_TTL_SEC = Number(process.env.REFRESH_TTL_SEC ?? 60 * 24 * 60 * 60);
 const OTP_DEV_CODE = process.env.OTP_DEV_CODE ?? '123456';
 const OTP_EXPOSE = (process.env.OTP_EXPOSE_DEV_CODE ?? 'false') === 'true';
 /** Zona horaria de la familia (Argentina). Render corre en UTC; sin esto los avisos salen +3h. */
@@ -215,16 +203,16 @@ function profilePublic(row, user) {
   };
 }
 
-function getOrCreateProfile(userId) {
-  let row = db
+async function getOrCreateProfile(userId) {
+  let row = await db
     .prepare('SELECT * FROM account_profiles WHERE user_id = ?')
     .get(userId);
   if (!row) {
     const ts = nowIso();
-    db.prepare(
+    await db.prepare(
       `INSERT INTO account_profiles (user_id, plan, updated_at) VALUES (?, 'free', ?)`,
     ).run(userId, ts);
-    row = db
+    row = await db
       .prepare('SELECT * FROM account_profiles WHERE user_id = ?')
       .get(userId);
   }
@@ -239,9 +227,9 @@ function emailOtpKey(email) {
   return `e:${normalizeEmail(email)}`;
 }
 
-function storeOtp(key) {
-  db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(key);
-  db.prepare(
+async function storeOtp(key) {
+  await db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(key);
+  await db.prepare(
     `INSERT INTO otp_codes (id, phone, code, expires_at, created_at) VALUES (?, ?, ?, ?, ?)`,
   ).run(
     uuid(),
@@ -252,8 +240,8 @@ function storeOtp(key) {
   );
 }
 
-function checkOtp(key, code) {
-  const otp = db
+async function checkOtp(key, code) {
+  const otp = await db
     .prepare('SELECT * FROM otp_codes WHERE phone = ? ORDER BY created_at DESC LIMIT 1')
     .get(key);
   if (!otp || new Date(otp.expires_at) < new Date() || otp.code !== String(code ?? '').trim()) {
@@ -262,21 +250,21 @@ function checkOtp(key, code) {
   return true;
 }
 
-function issueTokens(user) {
+async function issueTokens(user) {
   const accessToken = signJwt(
     { sub: user.id, role: user.role, familyId: user.family_id },
     JWT_SECRET,
-    2 * 60 * 60,
+    ACCESS_TTL_SEC,
   );
-  const refreshToken = signJwt({ sub: user.id, typ: 'refresh' }, JWT_REFRESH, 30 * 24 * 60 * 60);
-  db.prepare(
+  const refreshToken = signJwt({ sub: user.id, typ: 'refresh' }, JWT_REFRESH, REFRESH_TTL_SEC);
+  await db.prepare(
     `INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, created_at)
      VALUES (?, ?, ?, ?, ?)`,
   ).run(
     uuid(),
     user.id,
     hashToken(refreshToken),
-    new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    new Date(Date.now() + REFRESH_TTL_SEC * 1000).toISOString(),
     nowIso(),
   );
   return { accessToken, refreshToken };
@@ -311,20 +299,20 @@ function send(res, status, data, headers = {}) {
   res.end(body);
 }
 
-function authUser(req) {
+async function authUser(req) {
   const header = req.headers.authorization ?? '';
   if (!header.toLowerCase().startsWith('bearer ')) return null;
   try {
     const payload = verifyJwt(header.slice(7).trim(), JWT_SECRET);
-    return db.prepare('SELECT * FROM users WHERE id = ?').get(payload.sub) ?? null;
+    return await db.prepare('SELECT * FROM users WHERE id = ?').get(payload.sub) ?? null;
   } catch {
     return null;
   }
 }
 
-function findInvitation(tokenOrCode) {
+async function findInvitation(tokenOrCode) {
   const key = String(tokenOrCode).trim().toUpperCase();
-  return db
+  return await db
     .prepare(
       `SELECT i.*, f.name AS family_name
        FROM invitations i
@@ -338,9 +326,9 @@ function isAdultRole(role) {
   return role === 'admin_adult' || role === 'adult';
 }
 
-function familyHomePlace(familyId) {
+async function familyHomePlace(familyId) {
   if (!familyId) return null;
-  return db
+  return await db
     .prepare(
       `SELECT * FROM places
        WHERE family_id = ? AND type = 'home' AND status = 'active'
@@ -354,10 +342,10 @@ function isPlannedSpecialTrip(trip) {
   return Boolean(trip && !trip.routine_id && trip.destination_place_id);
 }
 
-function lookupFamilyPlace(familyId, placeId, placeName, opts = {}) {
+async function lookupFamilyPlace(familyId, placeId, placeName, opts = {}) {
   const includeInactive = opts.includeInactive === true;
   if (placeId) {
-    const byId = db
+    const byId = await db
       .prepare(
         `SELECT * FROM places WHERE id = ? AND family_id = ? AND status != 'deleted'`,
       )
@@ -366,7 +354,7 @@ function lookupFamilyPlace(familyId, placeId, placeName, opts = {}) {
   }
   const name = String(placeName ?? '').trim().toLowerCase();
   if (!name || !familyId) return null;
-  const rows = db
+  const rows = await db
     .prepare(
       includeInactive
         ? `SELECT * FROM places WHERE family_id = ? AND status != 'deleted'`
@@ -379,10 +367,10 @@ function lookupFamilyPlace(familyId, placeId, placeName, opts = {}) {
 }
 
 /** Casa, colegio o lugar con rutina activa: se sigue monitoreando aunque se cancele una especial. */
-function isStandingMonitoredPlace(place) {
+async function isStandingMonitoredPlace(place) {
   if (!place) return false;
   if (place.type === 'home' || place.type === 'school') return true;
-  const routine = db
+  const routine = await db
     .prepare(`SELECT id FROM routines WHERE place_id = ? AND active = 1 LIMIT 1`)
     .get(place.id);
   return Boolean(routine);
@@ -393,10 +381,10 @@ function isLiveTrip(trip) {
 }
 
 /** Destino de una especial ya cancelada, que no es lugar permanente/rutina. */
-function isCancelledSpecialDestination(place, kidId) {
+async function isCancelledSpecialDestination(place, kidId) {
   if (!place || !kidId) return false;
-  if (isStandingMonitoredPlace(place)) return false;
-  const live = db
+  if (await isStandingMonitoredPlace(place)) return false;
+  const live = await db
     .prepare(
       `SELECT id FROM trips
        WHERE kid_id = ? AND destination_place_id = ? AND status IN ('active','overdue')
@@ -404,7 +392,7 @@ function isCancelledSpecialDestination(place, kidId) {
     )
     .get(kidId, place.id);
   if (live) return false;
-  const cancelled = db
+  const cancelled = await db
     .prepare(
       `SELECT id FROM trips
        WHERE kid_id = ? AND destination_place_id = ?
@@ -415,9 +403,9 @@ function isCancelledSpecialDestination(place, kidId) {
   return Boolean(cancelled);
 }
 
-function retireTripOnlyDestination(place, exceptTripId = null) {
-  if (!place || isStandingMonitoredPlace(place)) return false;
-  const other = db
+async function retireTripOnlyDestination(place, exceptTripId = null) {
+  if (!place || await isStandingMonitoredPlace(place)) return false;
+  const other = await db
     .prepare(
       `SELECT id FROM trips
        WHERE destination_place_id = ? AND status IN ('active','overdue')
@@ -426,21 +414,21 @@ function retireTripOnlyDestination(place, exceptTripId = null) {
     )
     .get(place.id, exceptTripId, exceptTripId);
   if (other) return false;
-  db.prepare(
+  await db.prepare(
     `UPDATE places SET status = 'inactive' WHERE id = ? AND status = 'active'`,
   ).run(place.id);
   return true;
 }
 
-function cancelTripRecord(trip) {
-  db.prepare(
+async function cancelTripRecord(trip) {
+  await db.prepare(
     `UPDATE trips SET status = 'cancelled', ended_at = ?, phase = NULL WHERE id = ?`,
   ).run(nowIso(), trip.id);
   if (isPlannedSpecialTrip(trip) && trip.destination_place_id) {
-    const dest = db.prepare('SELECT * FROM places WHERE id = ?').get(trip.destination_place_id);
-    retireTripOnlyDestination(dest, trip.id);
+    const dest = await db.prepare('SELECT * FROM places WHERE id = ?').get(trip.destination_place_id);
+    await retireTripOnlyDestination(dest, trip.id);
   }
-  return db.prepare('SELECT * FROM trips WHERE id = ?').get(trip.id);
+  return await db.prepare('SELECT * FROM trips WHERE id = ?').get(trip.id);
 }
 
 function stoppedSharingPayload(kid, extra = {}) {
@@ -452,15 +440,15 @@ function stoppedSharingPayload(kid, extra = {}) {
   return payload;
 }
 
-function tripDestinationPlace(trip) {
+async function tripDestinationPlace(trip) {
   if (!trip?.destination_place_id) return null;
-  return db.prepare('SELECT * FROM places WHERE id = ?').get(trip.destination_place_id);
+  return await db.prepare('SELECT * FROM places WHERE id = ?').get(trip.destination_place_id);
 }
 
-function placeMatchesTripDestination(place, trip) {
+async function placeMatchesTripDestination(place, trip) {
   if (!place || !trip?.destination_place_id) return false;
   if (place.id === trip.destination_place_id) return true;
-  const dest = tripDestinationPlace(trip);
+  const dest = await tripDestinationPlace(trip);
   if (!dest) return false;
   return (
     String(place.name).trim().toLowerCase() ===
@@ -469,11 +457,11 @@ function placeMatchesTripDestination(place, trip) {
 }
 
 /** Si el celular manda arrival/departure sin placeId, inferir Casa vs destino según la fase. */
-function impliedSpecialTripPlace(trip, type, familyId) {
+async function impliedSpecialTripPlace(trip, type, familyId) {
   if (!isPlannedSpecialTrip(trip)) return null;
-  const dest = tripDestinationPlace(trip);
+  const dest = await tripDestinationPlace(trip);
   if (!dest) return null;
-  const home = familyHomePlace(familyId);
+  const home = await familyHomePlace(familyId);
   const phase = trip.phase || '';
   const headingOut =
     phase === 'pending_departure' || phase === 'en_route' || phase === '';
@@ -593,9 +581,9 @@ function defaultAlertPrefs() {
   };
 }
 
-function getAlertPrefs(userId) {
+async function getAlertPrefs(userId) {
   const prefs = defaultAlertPrefs();
-  const rows = db
+  const rows = await db
     .prepare(`SELECT event_type, enabled FROM alert_prefs WHERE user_id = ?`)
     .all(userId);
   for (const r of rows) {
@@ -608,9 +596,9 @@ function getAlertPrefs(userId) {
   return prefs;
 }
 
-function isAlertEnabled(userId, eventType) {
+async function isAlertEnabled(userId, eventType) {
   if (eventType === 'panic') return true;
-  const prefs = getAlertPrefs(userId);
+  const prefs = await getAlertPrefs(userId);
   if (Object.prototype.hasOwnProperty.call(prefs, eventType)) {
     return prefs[eventType] !== false;
   }
@@ -656,9 +644,9 @@ function eventMessage(type, kidName, placeName) {
   }
 }
 
-function findDeviceByInstall(installId) {
+async function findDeviceByInstall(installId) {
   if (!installId) return null;
-  return db
+  return await db
     .prepare(
       `SELECT d.*, u.name AS user_name, u.role AS user_role, u.family_id AS user_family_id, u.phone AS user_phone
        FROM devices d
@@ -670,13 +658,13 @@ function findDeviceByInstall(installId) {
 
 /** Un celular (install_id) = un solo integrante.
  *  Si la misma persona reinstala la app, se reata el celular nuevo. */
-function bindInstallToUser(installId, user, platform = 'android') {
+async function bindInstallToUser(installId, user, platform = 'android') {
   const idKey = String(installId ?? '').trim();
   if (idKey.length < 6) {
     return { ok: false, status: 400, error: 'No pudimos identificar este celular. Reinstalá la app.' };
   }
 
-  const byInstall = findDeviceByInstall(idKey);
+  const byInstall = await findDeviceByInstall(idKey);
   if (byInstall && byInstall.user_id !== user.id) {
     return {
       ok: false,
@@ -694,19 +682,19 @@ function bindInstallToUser(installId, user, platform = 'android') {
   }
 
   // Misma persona con otro install (reinstaló): liberar el registro viejo
-  db.prepare(
+  await db.prepare(
     `DELETE FROM devices WHERE user_id = ? AND (install_id IS NULL OR install_id != ?)`,
   ).run(user.id, idKey);
 
   if (byInstall) {
-    db.prepare(
+    await db.prepare(
       `UPDATE devices SET user_id = ?, platform = ?, last_seen_at = ? WHERE id = ?`,
     ).run(user.id, platform, nowIso(), byInstall.id);
     return { ok: true, deviceId: byInstall.id };
   }
 
   const deviceId = uuid();
-  db.prepare(
+  await db.prepare(
     `INSERT INTO devices
      (id, user_id, install_id, platform, push_token, location_permission, notifications_permission,
       last_seen_at, location_ok, created_at)
@@ -715,8 +703,8 @@ function bindInstallToUser(installId, user, platform = 'android') {
   return { ok: true, deviceId };
 }
 
-function fanOutNotifications(event, familyId, title, body, excludeUserId = null) {
-  const adults = db
+async function fanOutNotifications(event, familyId, title, body, excludeUserId = null) {
+  const adults = await db
     .prepare(
       `SELECT * FROM users WHERE family_id = ? AND role IN ('admin_adult','adult')`,
     )
@@ -724,16 +712,16 @@ function fanOutNotifications(event, familyId, title, body, excludeUserId = null)
   let count = 0;
   for (const adult of adults) {
     if (excludeUserId && adult.id === excludeUserId) continue;
-    if (!isAlertEnabled(adult.id, event.type)) continue;
+    if (!await isAlertEnabled(adult.id, event.type)) continue;
     const notifId = uuid();
-    db.prepare(
+    await db.prepare(
       `INSERT INTO notifications
        (id, event_id, recipient_user_id, status, title, body, sent_at, created_at)
        VALUES (?, ?, ?, 'sent', ?, ?, ?, ?)`,
     ).run(notifId, event.id, adult.id, title, body, nowIso(), nowIso());
     count += 1;
 
-    const device = db
+    const device = await db
       .prepare(
         `SELECT * FROM devices WHERE user_id = ? AND push_token IS NOT NULL ORDER BY last_seen_at DESC LIMIT 1`,
       )
@@ -748,7 +736,7 @@ function fanOutNotifications(event, familyId, title, body, excludeUserId = null)
         event.type === 'delay';
       const pushData = {};
       if (event.type === 'location_lost' || event.type === 'app_closed') {
-        const kidRow = db.prepare('SELECT * FROM users WHERE id = ?').get(event.kid_id);
+        const kidRow = await db.prepare('SELECT * FROM users WHERE id = ?').get(event.kid_id);
         Object.assign(pushData, stoppedSharingPayload(kidRow || { id: event.kid_id }));
         pushData.eventType = event.type;
       }
@@ -765,26 +753,26 @@ function fanOutNotifications(event, familyId, title, body, excludeUserId = null)
 }
 
 /** Aviso directo a un hijo/a (solo aceptaciones del adulto). */
-function notifyKidUser(kidId, title, body, eventId = null) {
+async function notifyKidUser(kidId, title, body, eventId = null) {
   if (!kidId) return 0;
-  const kid = db.prepare(`SELECT * FROM users WHERE id = ? AND role = 'kid'`).get(kidId);
+  const kid = await db.prepare(`SELECT * FROM users WHERE id = ? AND role = 'kid'`).get(kidId);
   if (!kid) return 0;
   let resolvedEventId = eventId;
   if (!resolvedEventId) {
     resolvedEventId = uuid();
-    db.prepare(
+    await db.prepare(
       `INSERT INTO events
        (id, kid_id, trip_id, type, place_id, notify, message, payload, created_at)
        VALUES (?, ?, NULL, 'place_approved', NULL, 0, ?, NULL, ?)`,
     ).run(resolvedEventId, kid.id, body, nowIso());
   }
   const notifId = uuid();
-  db.prepare(
+  await db.prepare(
     `INSERT INTO notifications
      (id, event_id, recipient_user_id, status, title, body, sent_at, created_at)
      VALUES (?, ?, ?, 'sent', ?, ?, ?, ?)`,
   ).run(notifId, resolvedEventId, kid.id, title, body, nowIso(), nowIso());
-  const device = db
+  const device = await db
     .prepare(
       `SELECT * FROM devices WHERE user_id = ? AND push_token IS NOT NULL ORDER BY last_seen_at DESC LIMIT 1`,
     )
@@ -795,10 +783,10 @@ function notifyKidUser(kidId, title, body, eventId = null) {
   return 1;
 }
 
-function checkDeviceHealthAlerts() {
+async function checkDeviceHealthAlerts() {
   // Si el menor no reporta en ~2 min, o apagó ubicación → aviso
   const staleBefore = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-  const devices = db
+  const devices = await db
     .prepare(
       `SELECT d.*, u.name AS user_name, u.role AS user_role, u.family_id
        FROM devices d
@@ -817,16 +805,16 @@ function checkDeviceHealthAlerts() {
     .all(staleBefore);
 
   for (const d of devices) {
-    const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(d.user_id);
+    const kid = await db.prepare('SELECT * FROM users WHERE id = ?').get(d.user_id);
     if (!kid) continue;
     const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-    const recent = db
+    const recent = await db
       .prepare(
         `SELECT id FROM events WHERE kid_id = ? AND type = 'location_lost' AND created_at >= ? LIMIT 1`,
       )
       .get(kid.id, since);
     if (recent) continue;
-    createEvent({
+    await createEvent({
       kid,
       type: 'location_lost',
       forceNotify: true,
@@ -841,7 +829,7 @@ function checkDeviceHealthAlerts() {
   }
 }
 
-function createEvent({
+async function createEvent({
   kid,
   type,
   placeId = null,
@@ -865,7 +853,7 @@ function createEvent({
 
   let resolvedTripId = tripId || null;
   let providedTrip = resolvedTripId
-    ? db.prepare('SELECT * FROM trips WHERE id = ?').get(resolvedTripId)
+    ? await db.prepare('SELECT * FROM trips WHERE id = ?').get(resolvedTripId)
     : null;
   const providedDeadSpecial =
     providedTrip && !isLiveTrip(providedTrip) && isPlannedSpecialTrip(providedTrip);
@@ -876,23 +864,23 @@ function createEvent({
 
   let resolvedPlaceId = placeId;
   let place = resolvedPlaceId
-    ? db.prepare('SELECT * FROM places WHERE id = ?').get(resolvedPlaceId)
+    ? await db.prepare('SELECT * FROM places WHERE id = ?').get(resolvedPlaceId)
     : null;
 
   if (type === 'arrival' || type === 'departure') {
     const placeGone = place && place.status !== 'active' && place.status !== 'pending_approval';
-    if (placeGone || isCancelledSpecialDestination(place, kid.id)) {
+    if (placeGone || await isCancelledSpecialDestination(place, kid.id)) {
       return { event: null, notifiedCount: 0, place: null, ignored: true };
     }
     // La app puede seguir mandando el tripId cancelado (sin placeId = infería el destino).
-    if (providedDeadSpecial && !isStandingMonitoredPlace(place)) {
+    if (providedDeadSpecial && !await isStandingMonitoredPlace(place)) {
       return { event: null, notifiedCount: 0, place: null, ignored: true };
     }
   }
 
   // Salida sin viaje activo → abrimos viaje abierto (sin hora de vuelta)
   if (type === 'departure' && !resolvedTripId) {
-    const existing = db
+    const existing = await db
       .prepare(
         `SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue')`,
       )
@@ -901,7 +889,7 @@ function createEvent({
       resolvedTripId = existing.id;
     } else {
       resolvedTripId = uuid();
-      db.prepare(
+      await db.prepare(
         `INSERT INTO trips
          (id, kid_id, destination_place_id, status, expected_return_at, started_at, created_at)
          VALUES (?, ?, NULL, 'active', NULL, ?, ?)`,
@@ -909,7 +897,7 @@ function createEvent({
     }
   }
   if (type === 'arrival' && !resolvedTripId) {
-    const existing = db
+    const existing = await db
       .prepare(
         `SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC LIMIT 1`,
       )
@@ -918,7 +906,7 @@ function createEvent({
   }
 
   let activeTrip = resolvedTripId
-    ? db.prepare('SELECT * FROM trips WHERE id = ?').get(resolvedTripId)
+    ? await db.prepare('SELECT * FROM trips WHERE id = ?').get(resolvedTripId)
     : null;
   if (activeTrip && !isLiveTrip(activeTrip)) {
     activeTrip = null;
@@ -926,13 +914,13 @@ function createEvent({
   }
 
   if (!place && (type === 'arrival' || type === 'departure')) {
-    place = impliedSpecialTripPlace(activeTrip, type, kid.family_id);
+    place = await impliedSpecialTripPlace(activeTrip, type, kid.family_id);
     if (place) resolvedPlaceId = place.id;
   }
 
   // Anti-duplicados: mismo tipo+lugar en los últimos 90s (después de resolver el lugar)
   const since = new Date(Date.now() - 90 * 1000).toISOString();
-  const dup = db
+  const dup = await db
     .prepare(
       `SELECT * FROM events
        WHERE kid_id = ? AND type = ? AND created_at >= ?
@@ -945,7 +933,7 @@ function createEvent({
       event: eventPublic(dup),
       notifiedCount: 0,
       place: resolvedPlaceId
-        ? placePublic(db.prepare('SELECT * FROM places WHERE id = ?').get(resolvedPlaceId))
+        ? placePublic(await db.prepare('SELECT * FROM places WHERE id = ?').get(resolvedPlaceId))
         : null,
       deduped: true,
     };
@@ -956,7 +944,7 @@ function createEvent({
   // No la incrustamos acá: en Render UTC salía desfasada (+3h en Argentina).
   const message = baseMessage;
   const id = uuid();
-  db.prepare(
+  await db.prepare(
     `INSERT INTO events
      (id, kid_id, trip_id, type, place_id, notify, message, payload, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -971,27 +959,27 @@ function createEvent({
     payload ? JSON.stringify(payload) : null,
     nowIso(),
   );
-  const event = db.prepare('SELECT * FROM events WHERE id = ?').get(id);
+  const event = await db.prepare('SELECT * FROM events WHERE id = ?').get(id);
 
   if (type === 'arrival') {
     const arrivedHome = place?.type === 'home';
-    const arrivedAtDest = placeMatchesTripDestination(place, activeTrip);
+    const arrivedAtDest = await placeMatchesTripDestination(place, activeTrip);
     // Salida especial (super, etc.): ENTER destino NO cierra; ENTER Casa sí.
     // Viajes abiertos por rutina/departure: cualquier llegada cierra (igual que antes).
     const shouldClose =
       !isPlannedSpecialTrip(activeTrip) || arrivedHome;
     if (shouldClose) {
       if (resolvedTripId) {
-        db.prepare(
+        await db.prepare(
           `UPDATE trips SET status = 'arrived', ended_at = ? WHERE id = ? AND status IN ('active','overdue')`,
         ).run(nowIso(), resolvedTripId);
       } else {
-        db.prepare(
+        await db.prepare(
           `UPDATE trips SET status = 'arrived', ended_at = ? WHERE kid_id = ? AND status IN ('active','overdue')`,
         ).run(nowIso(), kid.id);
       }
     } else if (arrivedAtDest && activeTrip) {
-      db.prepare(`UPDATE trips SET phase = 'at_destination' WHERE id = ?`).run(
+      await db.prepare(`UPDATE trips SET phase = 'at_destination' WHERE id = ?`).run(
         activeTrip.id,
       );
     }
@@ -999,17 +987,17 @@ function createEvent({
   if (type === 'departure' && activeTrip && isPlannedSpecialTrip(activeTrip)) {
     const now = nowIso();
     if (place?.type === 'home') {
-      db.prepare(
+      await db.prepare(
         `UPDATE trips SET phase = 'en_route', departed_at = COALESCE(departed_at, ?) WHERE id = ? AND status IN ('active','overdue')`,
       ).run(now, activeTrip.id);
-    } else if (placeMatchesTripDestination(place, activeTrip)) {
-      db.prepare(
+    } else if (await placeMatchesTripDestination(place, activeTrip)) {
+      await db.prepare(
         `UPDATE trips SET phase = 'returning' WHERE id = ? AND status IN ('active','overdue')`,
       ).run(activeTrip.id);
     }
   }
   if (type === 'im_ok') {
-    db.prepare(
+    await db.prepare(
       `UPDATE trips SET status = 'arrived', ended_at = ? WHERE kid_id = ? AND status = 'overdue'`,
     ).run(nowIso(), kid.id);
   }
@@ -1034,7 +1022,7 @@ function createEvent({
                 : type === 'place_suggested'
                   ? 'Lugar sugerido'
                   : 'Llegué';
-    notifiedCount = fanOutNotifications(
+    notifiedCount = await fanOutNotifications(
       event,
       kid.family_id,
       title,
@@ -1049,9 +1037,9 @@ function createEvent({
   };
 }
 
-function checkDelayedTrips() {
+async function checkDelayedTrips() {
   const now = nowIso();
-  const overdue = db
+  const overdue = await db
     .prepare(
       `SELECT * FROM trips
        WHERE status = 'active'
@@ -1061,16 +1049,16 @@ function checkDelayedTrips() {
     .all(now);
   for (const trip of overdue) {
     if (trip.phase === 'pending_departure') continue;
-    const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(trip.kid_id);
+    const kid = await db.prepare('SELECT * FROM users WHERE id = ?').get(trip.kid_id);
     if (!kid) continue;
-    const already = db
+    const already = await db
       .prepare(
         `SELECT id FROM events WHERE trip_id = ? AND type = 'delay' LIMIT 1`,
       )
       .get(trip.id);
     if (already) continue;
-    db.prepare(`UPDATE trips SET status = 'overdue' WHERE id = ?`).run(trip.id);
-    createEvent({
+    await db.prepare(`UPDATE trips SET status = 'overdue' WHERE id = ?`).run(trip.id);
+    await createEvent({
       kid,
       type: 'delay',
       placeId: trip.destination_place_id,
@@ -1081,9 +1069,9 @@ function checkDelayedTrips() {
 }
 
 /** Salidas abiertas SIN destino → recordatorio "¿A casa?". Si ya hay destino (Modista, etc.) no aplica. */
-function checkReturnPrompts() {
+async function checkReturnPrompts() {
   const cutoff = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-  const openTrips = db
+  const openTrips = await db
     .prepare(
       `SELECT * FROM trips
        WHERE status = 'active'
@@ -1100,15 +1088,15 @@ function checkReturnPrompts() {
     )
     .all(cutoff, cutoff);
   for (const trip of openTrips) {
-    const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(trip.kid_id);
+    const kid = await db.prepare('SELECT * FROM users WHERE id = ?').get(trip.kid_id);
     if (!kid) continue;
-    const already = db
+    const already = await db
       .prepare(
         `SELECT id FROM events WHERE trip_id = ? AND type = 'return_prompt' LIMIT 1`,
       )
       .get(trip.id);
     if (already) continue;
-    createEvent({
+    await createEvent({
       kid,
       type: 'return_prompt',
       placeId: trip.destination_place_id,
@@ -1121,11 +1109,11 @@ function checkReturnPrompts() {
 
 /** Demora de rutina: ~5 min después del INICIO y todavía no hubo llegada al lugar hoy.
  *  Si después llega, el geofence genera `arrival` y avisa igual. */
-function checkRoutineDelays() {
+async function checkRoutineDelays() {
   const graceAfterStartMin = 5;
   const day = todayWeekday();
   const nowMin = localMinutesNow();
-  const routines = db.prepare(`SELECT * FROM routines WHERE active = 1`).all();
+  const routines = await db.prepare(`SELECT * FROM routines WHERE active = 1`).all();
   const dayStartIso = startOfLocalDayIso();
 
   for (const routine of routines) {
@@ -1139,10 +1127,10 @@ function checkRoutineDelays() {
     // Fuera de la ventana del día de esa rutina (evita avisos a la noche).
     if (nowMin > endMin + 30) continue;
 
-    const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(routine.kid_id);
+    const kid = await db.prepare('SELECT * FROM users WHERE id = ?').get(routine.kid_id);
     if (!kid || kid.role !== 'kid') continue;
 
-    const arrived = db
+    const arrived = await db
       .prepare(
         `SELECT id FROM events
          WHERE kid_id = ? AND place_id = ? AND type = 'arrival' AND created_at >= ?
@@ -1151,7 +1139,7 @@ function checkRoutineDelays() {
       .get(kid.id, routine.place_id, dayStartIso);
     if (arrived) continue;
 
-    const already = db
+    const already = await db
       .prepare(
         `SELECT id FROM events
          WHERE kid_id = ? AND type = 'delay' AND place_id = ? AND created_at >= ?
@@ -1160,7 +1148,7 @@ function checkRoutineDelays() {
       .get(kid.id, routine.place_id, dayStartIso);
     if (already) continue;
 
-    createEvent({
+    await createEvent({
       kid,
       type: 'delay',
       placeId: routine.place_id,
@@ -1175,7 +1163,7 @@ function checkRoutineDelays() {
   }
 }
 
-function memberPresence(m, lastEvent, activeTrip, healthIssue) {
+async function memberPresence(m, lastEvent, activeTrip, healthIssue) {
   if (healthIssue) {
     return {
       presenceStatus: 'alert',
@@ -1196,11 +1184,11 @@ function memberPresence(m, lastEvent, activeTrip, healthIssue) {
   const lastType = lastEvent?.type;
   let placeName = null;
   if (lastEvent?.place_id) {
-    const p = db.prepare('SELECT * FROM places WHERE id = ?').get(lastEvent.place_id);
+    const p = await db.prepare('SELECT * FROM places WHERE id = ?').get(lastEvent.place_id);
     placeName = p?.name ?? null;
   }
   if (activeTrip?.destination_place_id) {
-    const p = db
+    const p = await db
       .prepare('SELECT * FROM places WHERE id = ?')
       .get(activeTrip.destination_place_id);
     if (p?.name) placeName = p.name;
@@ -1414,7 +1402,26 @@ const server = http.createServer(async (req, res) => {
     const { pathname } = url;
 
     if (req.method === 'GET' && pathname === '/health') {
-      return send(res, 200, { ok: true, service: 'llegue-api-v2' });
+      let dbOk = false;
+      try {
+        dbOk = await db.ping();
+      } catch {
+        dbOk = false;
+      }
+      const persistent = db?.dialect === 'postgres';
+      const prod = (process.env.NODE_ENV || '') === 'production';
+      if (!dbOk || (prod && !persistent)) {
+        return send(res, 503, {
+          ok: false,
+          service: 'llegue-api-v2',
+          db: db?.info?.() ?? { dialect: 'none', persistent: false },
+          error:
+            prod && !persistent
+              ? 'Falta DATABASE_URL (Postgres). SQLite no sobrevive el sleep/redeploy de Render.'
+              : 'La base de datos no responde.',
+        });
+      }
+      return send(res, 200, { ok: true, service: 'llegue-api-v2', db: db.info() });
     }
 
     if (req.method === 'GET' && (pathname === '/' || pathname === '/probar')) {
@@ -1449,7 +1456,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && pathname.startsWith('/i/')) {
       const token = pathname.slice(3).split('?')[0];
-      const inv = findInvitation(token);
+      const inv = await findInvitation(token);
       const host = req.headers.host || `localhost:${PORT}`;
       const base = publicInviteBase(null, host);
       if (!inv || inv.status !== 'pending' || new Date(inv.expires_at) < new Date()) {
@@ -1480,7 +1487,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const phone = normalizePhone(body.phone ?? '');
       if (phone.length < 8) return send(res, 400, { error: 'Escribí un teléfono válido.' });
-      storeOtp(phone);
+      await storeOtp(phone);
       const payload = { ok: true, message: 'Te enviamos un código.' };
       if (OTP_EXPOSE) payload.devCode = OTP_DEV_CODE;
       return send(res, 200, payload);
@@ -1492,7 +1499,7 @@ const server = http.createServer(async (req, res) => {
       if (!email.includes('@') || email.length < 6) {
         return send(res, 400, { error: 'Escribí un mail válido.' });
       }
-      storeOtp(emailOtpKey(email));
+      await storeOtp(emailOtpKey(email));
       const payload = {
         ok: true,
         message: 'Te enviamos un código a tu correo.',
@@ -1513,16 +1520,16 @@ const server = http.createServer(async (req, res) => {
       if (name.length < 2) return send(res, 400, { error: 'Escribí tu nombre completo.' });
       if (!email.includes('@')) return send(res, 400, { error: 'Escribí un mail válido.' });
       if (phone.length < 8) return send(res, 400, { error: 'Escribí un teléfono válido.' });
-      if (!checkOtp(emailOtpKey(email), emailCode)) {
+      if (!await checkOtp(emailOtpKey(email), emailCode)) {
         return send(res, 400, { error: 'El código del mail no es válido o venció.' });
       }
-      if (!checkOtp(phone, phoneCode)) {
+      if (!await checkOtp(phone, phoneCode)) {
         return send(res, 400, { error: 'El código del teléfono no es válido o venció.' });
       }
 
-      const already = findDeviceByInstall(installId);
+      const already = await findDeviceByInstall(installId);
       if (already && already.user_id) {
-        const bound = db.prepare('SELECT * FROM users WHERE id = ?').get(already.user_id);
+        const bound = await db.prepare('SELECT * FROM users WHERE id = ?').get(already.user_id);
         if (bound && bound.phone && bound.phone !== phone) {
           return send(res, 409, {
             error:
@@ -1532,8 +1539,8 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      const byPhone = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
-      const byEmail = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+      const byPhone = await db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
+      const byEmail = await db.prepare('SELECT * FROM users WHERE email = ?').get(email);
       if (byPhone || byEmail) {
         return send(res, 409, {
           error: 'Ese teléfono o mail ya tiene cuenta. Entrá con “Ya tengo cuenta” o usá otro dato.',
@@ -1541,30 +1548,30 @@ const server = http.createServer(async (req, res) => {
       }
 
       const id = uuid();
-      db.prepare(
+      await db.prepare(
         `INSERT INTO users (id, family_id, role, name, phone, email, birth_date, created_at)
          VALUES (?, NULL, 'admin_adult', ?, ?, ?, ?, ?)`,
       ).run(id, name, phone, email, birthDate, nowIso());
-      const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-      const bind = bindInstallToUser(installId, user, body.platform ?? 'android');
+      const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android');
       if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
 
-      db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(phone);
-      db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(emailOtpKey(email));
+      await db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(phone);
+      await db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(emailOtpKey(email));
 
       return send(res, 201, {
         user: userPublic(user),
         deviceId: bind.deviceId,
-        ...issueTokens(user),
+        ...(await issueTokens(user)),
       });
     }
 
     if (req.method === 'GET' && pathname === '/devices/lookup') {
       const installId = url.searchParams.get('installId') ?? '';
-      const bound = findDeviceByInstall(installId);
+      const bound = await findDeviceByInstall(installId);
       if (!bound) return send(res, 200, { bound: false });
       const family = bound.user_family_id
-        ? db.prepare('SELECT * FROM families WHERE id = ?').get(bound.user_family_id)
+        ? await db.prepare('SELECT * FROM families WHERE id = ?').get(bound.user_family_id)
         : null;
       return send(res, 200, {
         bound: true,
@@ -1583,7 +1590,7 @@ const server = http.createServer(async (req, res) => {
       const phone = normalizePhone(body.phone ?? '');
       const code = String(body.code ?? '').trim();
       const installId = body.installId;
-      const otp = db
+      const otp = await db
         .prepare('SELECT * FROM otp_codes WHERE phone = ? ORDER BY created_at DESC LIMIT 1')
         .get(phone);
       if (!otp || new Date(otp.expires_at) < new Date() || otp.code !== code) {
@@ -1591,7 +1598,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Si este celular ya es de otra persona, no dejar entrar con otro teléfono/rol
-      const already = findDeviceByInstall(installId);
+      const already = await findDeviceByInstall(installId);
       if (already && already.user_phone && already.user_phone !== phone) {
         return send(res, 409, {
           error:
@@ -1606,7 +1613,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (already && !already.user_phone && already.user_id) {
         // Celular atado a hijo/a con PIN: no permitir OTP de otra persona
-        const boundUser = db.prepare('SELECT * FROM users WHERE id = ?').get(already.user_id);
+        const boundUser = await db.prepare('SELECT * FROM users WHERE id = ?').get(already.user_id);
         if (boundUser && boundUser.phone !== phone) {
           return send(res, 409, {
             error:
@@ -1616,7 +1623,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      let user = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
+      let user = await db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
       if (!user) {
         if (already) {
           return send(res, 409, {
@@ -1626,28 +1633,28 @@ const server = http.createServer(async (req, res) => {
           });
         }
         const id = uuid();
-        db.prepare(
+        await db.prepare(
           `INSERT INTO users (id, family_id, role, name, phone, created_at)
            VALUES (?, NULL, 'adult', ?, ?, ?)`,
         ).run(id, (body.name ?? '').trim() || 'Sin nombre', phone, nowIso());
-        user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+        user = await db.prepare('SELECT * FROM users WHERE id = ?').get(id);
       }
 
-      const bind = bindInstallToUser(installId, user, body.platform ?? 'android');
+      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android');
       if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
 
-      db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(phone);
+      await db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(phone);
       return send(res, 200, {
         user: userPublic(user),
         deviceId: bind.deviceId,
-        ...issueTokens(user),
+        ...(await issueTokens(user)),
       });
     }
 
     if (req.method === 'POST' && pathname === '/auth/login-with-pin') {
       const body = await readBody(req);
       const installId = body.installId;
-      const inv = findInvitation(body.inviteTokenOrCode ?? '');
+      const inv = await findInvitation(body.inviteTokenOrCode ?? '');
       if (!inv || inv.status !== 'pending' || new Date(inv.expires_at) < new Date()) {
         return send(res, 404, { error: 'Esa invitación no sirve o venció.' });
       }
@@ -1658,10 +1665,10 @@ const server = http.createServer(async (req, res) => {
         return send(res, 401, { error: 'PIN incorrecto.' });
       }
 
-      const already = findDeviceByInstall(installId);
+      const already = await findDeviceByInstall(installId);
       if (already && already.user_id) {
         // Si es otro usuario, bloquear; si es reinstalación del mismo, bindInstall lo reata
-        const boundUser = db.prepare('SELECT * FROM users WHERE id = ?').get(already.user_id);
+        const boundUser = await db.prepare('SELECT * FROM users WHERE id = ?').get(already.user_id);
         if (boundUser && boundUser.role === 'kid' && boundUser.name === inv.name_hint) {
           // permitir continuar hacia bind
         } else if (already) {
@@ -1673,35 +1680,35 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      let user = db
+      let user = await db
         .prepare(`SELECT * FROM users WHERE family_id = ? AND role = 'kid' AND name = ?`)
         .get(inv.family_id, inv.name_hint);
       if (!user) {
         const id = uuid();
-        db.prepare(
+        await db.prepare(
           `INSERT INTO users (id, family_id, role, name, pin_hash, created_at)
            VALUES (?, ?, 'kid', ?, ?, ?)`,
         ).run(id, inv.family_id, inv.name_hint, inv.pin_hash, nowIso());
-        user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+        user = await db.prepare('SELECT * FROM users WHERE id = ?').get(id);
       }
-      db.prepare(
+      await db.prepare(
         `UPDATE invitations SET status = 'accepted', accepted_by_user_id = ? WHERE id = ?`,
       ).run(user.id, inv.id);
-      const bind = bindInstallToUser(installId, user, body.platform ?? 'android');
+      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android');
       if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
       return send(res, 200, {
         user: userPublic(user),
         family: { id: inv.family_id, name: inv.family_name },
         deviceId: bind.deviceId,
-        ...issueTokens(user),
+        ...(await issueTokens(user)),
       });
     }
 
     if (req.method === 'GET' && pathname === '/auth/me') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       const family = user.family_id
-        ? db.prepare('SELECT * FROM families WHERE id = ?').get(user.family_id)
+        ? await db.prepare('SELECT * FROM families WHERE id = ?').get(user.family_id)
         : null;
       return send(res, 200, {
         user: userPublic(user),
@@ -1709,12 +1716,42 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (req.method === 'POST' && pathname === '/auth/refresh') {
+      const body = await readBody(req);
+      const token = String(body.refreshToken ?? '').trim();
+      if (token.length < 10) {
+        return send(res, 400, { error: 'Falta el refresh token.' });
+      }
+      try {
+        const payload = verifyJwt(token, JWT_REFRESH);
+        if (payload.typ && payload.typ !== 'refresh') {
+          return send(res, 401, { error: 'Sesión inválida.' });
+        }
+        const hash = hashToken(token);
+        const stored = await db
+          .prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?')
+          .get(hash);
+        if (!stored || stored.user_id !== payload.sub || new Date(stored.expires_at) < new Date()) {
+          return send(res, 401, { error: 'Sesión inválida.' });
+        }
+        const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(payload.sub);
+        if (!user) return send(res, 401, { error: 'Sesión inválida.' });
+        await db.prepare('DELETE FROM refresh_tokens WHERE id = ?').run(stored.id);
+        return send(res, 200, {
+          user: userPublic(user),
+          ...(await issueTokens(user)),
+        });
+      } catch {
+        return send(res, 401, { error: 'Sesión vencida.' });
+      }
+    }
+
     if (req.method === 'GET' && pathname === '/account/profile') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
-      const profile = getOrCreateProfile(user.id);
+      const profile = await getOrCreateProfile(user.id);
       const family = user.family_id
-        ? db.prepare('SELECT * FROM families WHERE id = ?').get(user.family_id)
+        ? await db.prepare('SELECT * FROM families WHERE id = ?').get(user.family_id)
         : null;
       return send(res, 200, {
         user: userPublic(user),
@@ -1726,7 +1763,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'PATCH' && pathname === '/account/profile') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       if (user.role !== 'admin_adult' && user.role !== 'adult') {
         return send(res, 403, {
@@ -1734,7 +1771,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
       const body = await readBody(req);
-      const profile = getOrCreateProfile(user.id);
+      const profile = await getOrCreateProfile(user.id);
       const emailRaw = body.email != null ? String(body.email).trim() : profile.email;
       const email =
         emailRaw == null || emailRaw === ''
@@ -1801,23 +1838,23 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: 'El nombre es muy corto.' });
       }
       const ts = nowIso();
-      db.prepare(
+      await db.prepare(
         `UPDATE account_profiles
          SET email = ?, city = ?, kids_count = ?, kids_ages = ?,
              main_concern = ?, how_found = ?, plan = 'free', updated_at = ?
          WHERE user_id = ?`,
       ).run(email, city, kidsCount, kidsAges, mainConcern, howFound, ts, user.id);
       if (email != null || displayName) {
-        db.prepare(
+        await db.prepare(
           `UPDATE users SET email = COALESCE(?, email), name = COALESCE(?, name) WHERE id = ?`,
         ).run(email, displayName && displayName.length >= 2 ? displayName : null, user.id);
       }
-      const updatedUser = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
-      const updatedProfile = db
+      const updatedUser = await db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+      const updatedProfile = await db
         .prepare('SELECT * FROM account_profiles WHERE user_id = ?')
         .get(user.id);
       const family = updatedUser.family_id
-        ? db.prepare('SELECT * FROM families WHERE id = ?').get(updatedUser.family_id)
+        ? await db.prepare('SELECT * FROM families WHERE id = ?').get(updatedUser.family_id)
         : null;
       return send(res, 200, {
         user: userPublic(updatedUser),
@@ -1830,7 +1867,7 @@ const server = http.createServer(async (req, res) => {
 
     // FAMILIES
     if (req.method === 'POST' && pathname === '/families') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       if (user.family_id) return send(res, 400, { error: 'Ya estás en una familia.' });
       const body = await readBody(req);
@@ -1841,29 +1878,29 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: 'Escribí el nombre de la familia y tu rol.' });
       }
       if (body.installId) {
-        const bind = bindInstallToUser(body.installId, user, body.platform ?? 'android');
+        const bind = await bindInstallToUser(body.installId, user, body.platform ?? 'android');
         if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
       }
       const familyId = uuid();
-      db.prepare(`INSERT INTO families (id, name, created_at) VALUES (?, ?, ?)`).run(
+      await db.prepare(`INSERT INTO families (id, name, created_at) VALUES (?, ?, ?)`).run(
         familyId,
         familyName,
         nowIso(),
       );
-      db.prepare(
+      await db.prepare(
         `UPDATE users SET family_id = ?, role = 'admin_adult', name = ?, relationship_label = ? WHERE id = ?`,
       ).run(familyId, displayName, relationshipLabel, user.id);
-      const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+      const updated = await db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
       return send(res, 201, {
         family: { id: familyId, name: familyName, createdAt: nowIso() },
         user: userPublic(updated),
-        ...issueTokens(updated),
+        ...(await issueTokens(updated)),
       });
     }
 
     // INVITATIONS
     if (req.method === 'POST' && pathname === '/invitations') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id || (user.role !== 'admin_adult' && user.role !== 'adult')) {
         return send(res, 403, { error: 'Solo un adulto de la familia puede invitar.' });
       }
@@ -1882,12 +1919,12 @@ const server = http.createServer(async (req, res) => {
       const deepLinkToken = randomToken(10);
       const id = uuid();
       const expiresAt = new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString();
-      db.prepare(
+      await db.prepare(
         `INSERT INTO invitations
          (id, family_id, created_by_user_id, role, name_hint, code, deep_link_token, status, pin_hash, expires_at, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
       ).run(id, user.family_id, user.id, role, name, code, deepLinkToken, pinHash, expiresAt, nowIso());
-      const family = db.prepare('SELECT * FROM families WHERE id = ?').get(user.family_id);
+      const family = await db.prepare('SELECT * FROM families WHERE id = ?').get(user.family_id);
       const host = req.headers.host || `localhost:${PORT}`;
       const base = publicInviteBase(body.publicBaseUrl, host);
       const inviteUrl = `${base}/i/${deepLinkToken}`;
@@ -1917,7 +1954,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && pathname.startsWith('/invitations/') && !pathname.endsWith('/accept')) {
       const token = pathname.slice('/invitations/'.length);
-      const inv = findInvitation(token);
+      const inv = await findInvitation(token);
       if (!inv || inv.status !== 'pending' || new Date(inv.expires_at) < new Date()) {
         return send(res, 410, { error: 'Esta invitación ya no sirve. Pedí una nueva.' });
       }
@@ -1938,11 +1975,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname.startsWith('/invitations/') && pathname.endsWith('/accept')) {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       if (user.family_id) return send(res, 400, { error: 'Ya estás en una familia.' });
       const token = pathname.slice('/invitations/'.length, -'/accept'.length);
-      const inv = findInvitation(token);
+      const inv = await findInvitation(token);
       if (!inv || inv.status !== 'pending' || new Date(inv.expires_at) < new Date()) {
         return send(res, 404, { error: 'Esta invitación no sirve o venció.' });
       }
@@ -1953,10 +1990,10 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      const bind = bindInstallToUser(body.installId, user, body.platform ?? 'android');
+      const bind = await bindInstallToUser(body.installId, user, body.platform ?? 'android');
       if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
 
-      db.prepare(
+      await db.prepare(
         `UPDATE users SET family_id = ?, role = ?, name = ?, relationship_label = ?, pin_hash = COALESCE(?, pin_hash)
          WHERE id = ?`,
       ).run(
@@ -1967,38 +2004,38 @@ const server = http.createServer(async (req, res) => {
         inv.pin_hash,
         user.id,
       );
-      db.prepare(
+      await db.prepare(
         `UPDATE invitations SET status = 'accepted', accepted_by_user_id = ? WHERE id = ?`,
       ).run(user.id, inv.id);
-      const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+      const updated = await db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
       return send(res, 200, {
         user: userPublic(updated),
         family: { id: inv.family_id, name: inv.family_name },
         deviceId: bind.deviceId,
-        ...issueTokens(updated),
+        ...(await issueTokens(updated)),
       });
     }
 
     // DEVICES
     if (req.method === 'POST' && pathname === '/devices/register') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       const body = await readBody(req);
       const installId = body.installId;
       if (!installId) {
         return send(res, 400, { error: 'Falta identificar el celular.' });
       }
-      const bind = bindInstallToUser(installId, user, body.platform ?? 'android');
+      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android');
       if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
 
       if (body.pushToken) {
-        db.prepare(`UPDATE devices SET push_token = ?, last_seen_at = ? WHERE id = ?`).run(
+        await db.prepare(`UPDATE devices SET push_token = ?, last_seen_at = ? WHERE id = ?`).run(
           body.pushToken,
           nowIso(),
           bind.deviceId,
         );
       }
-      const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(bind.deviceId);
+      const device = await db.prepare('SELECT * FROM devices WHERE id = ?').get(bind.deviceId);
       return send(res, 201, {
         device: {
           id: device.id,
@@ -2014,7 +2051,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'PATCH' && pathname === '/devices/me/battery') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       const body = await readBody(req);
       const level = Number(body.batteryLevel);
@@ -2022,35 +2059,35 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: 'Falta el nivel de batería.' });
       }
       let device = body.deviceId
-        ? db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
-        : db
+        ? await db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
+        : await db
             .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
             .get(user.id);
       if (!device) {
         const id = uuid();
-        db.prepare(
+        await db.prepare(
           `INSERT INTO devices
            (id, user_id, platform, location_permission, notifications_permission, battery_level, last_seen_at, created_at)
            VALUES (?, ?, 'android', 'not_asked', 'not_asked', ?, ?, ?)`,
         ).run(id, user.id, Math.round(level), nowIso(), nowIso());
-        device = db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+        device = await db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
       } else {
-        db.prepare(
+        await db.prepare(
           `UPDATE devices SET battery_level = ?, last_seen_at = ? WHERE id = ?`,
         ).run(Math.round(level), nowIso(), device.id);
-        device = db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id);
+        device = await db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id);
       }
 
       let eventResult = null;
       if (level <= 20 && user.role === 'kid' && user.family_id) {
         const sinceBatt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-        const recentBatt = db
+        const recentBatt = await db
           .prepare(
             `SELECT id FROM events WHERE kid_id = ? AND type = 'low_battery' AND created_at >= ? LIMIT 1`,
           )
           .get(user.id, sinceBatt);
         if (!recentBatt) {
-          eventResult = createEvent({
+          eventResult = await createEvent({
             kid: user,
             type: 'low_battery',
             payload: { batteryLevel: Math.round(level) },
@@ -2069,7 +2106,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'PATCH' && pathname === '/devices/me/presence') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       const body = await readBody(req);
       const state = String(body.state ?? '').toLowerCase();
@@ -2077,15 +2114,15 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: 'Estado inválido.' });
       }
       let device = body.deviceId
-        ? db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
-        : db
+        ? await db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
+        : await db
             .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
             .get(user.id);
       if (!device) {
         return send(res, 404, { error: 'No encontramos este celular.' });
       }
       const bgAt = state === 'background' ? nowIso() : null;
-      db.prepare(
+      await db.prepare(
         `UPDATE devices SET app_state = ?, app_background_at = ?, last_seen_at = ? WHERE id = ?`,
       ).run(state, bgAt, nowIso(), device.id);
 
@@ -2099,13 +2136,13 @@ const server = http.createServer(async (req, res) => {
         user.family_id
       ) {
         const since = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-        const recent = db
+        const recent = await db
           .prepare(
             `SELECT id FROM events WHERE kid_id = ? AND type = 'app_closed' AND created_at >= ? LIMIT 1`,
           )
           .get(user.id, since);
         if (!recent) {
-          eventResult = createEvent({
+          eventResult = await createEvent({
             kid: user,
             type: 'app_closed',
             forceNotify: true,
@@ -2121,28 +2158,28 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'PATCH' && pathname === '/devices/me/permissions') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       const body = await readBody(req);
       let device = body.deviceId
-        ? db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
-        : db
+        ? await db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
+        : await db
             .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
             .get(user.id);
       if (!device) {
         const id = uuid();
-        db.prepare(
+        await db.prepare(
           `INSERT INTO devices
            (id, user_id, platform, location_permission, notifications_permission, last_seen_at, created_at)
            VALUES (?, ?, 'android', 'not_asked', 'not_asked', ?, ?)`,
         ).run(id, user.id, nowIso(), nowIso());
-        device = db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+        device = await db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
       }
       const locationOk = body.locationPermission === 'always';
       const notifOk = body.notificationsPermission === 'granted';
       const completed = locationOk && notifOk;
       const gpsOk = body.locationOk === false ? 0 : 1;
-      db.prepare(
+      await db.prepare(
         `UPDATE devices SET location_permission = ?, notifications_permission = ?,
          permissions_completed_at = ?, last_seen_at = ?, location_ok = ? WHERE id = ?`,
       ).run(
@@ -2153,7 +2190,7 @@ const server = http.createServer(async (req, res) => {
         gpsOk,
         device.id,
       );
-      const updated = db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id);
+      const updated = await db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id);
 
       // Si el menor apagó ubicación o no dio “Siempre”, avisar ya a los adultos
       if (
@@ -2162,13 +2199,13 @@ const server = http.createServer(async (req, res) => {
         (!locationOk || gpsOk === 0)
       ) {
         const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-        const recent = db
+        const recent = await db
           .prepare(
             `SELECT id FROM events WHERE kid_id = ? AND type = 'location_lost' AND created_at >= ? LIMIT 1`,
           )
           .get(user.id, since);
         if (!recent) {
-          createEvent({
+          await createEvent({
             kid: user,
             type: 'location_lost',
             forceNotify: true,
@@ -2196,10 +2233,10 @@ const server = http.createServer(async (req, res) => {
 
     // PLACES
     if (req.method === 'GET' && pathname === '/places') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       const includePending = url.searchParams.get('includePending') === '1';
-      const rows = db
+      const rows = await db
         .prepare(
           includePending && isAdultRole(user.role)
             ? `SELECT * FROM places WHERE family_id = ? AND status != 'deleted' AND status != 'inactive' ORDER BY created_at DESC`
@@ -2210,7 +2247,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/places') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       if (!isAdultRole(user.role)) {
         return send(res, 403, { error: 'Solo un adulto puede cargar lugares. Podés sugerir uno.' });
@@ -2228,16 +2265,16 @@ const server = http.createServer(async (req, res) => {
         ? body.type
         : 'favorite';
       const radius = Number(body.radiusM) > 0 ? Math.min(Number(body.radiusM), 500) : 60;
-      db.prepare(
+      await db.prepare(
         `INSERT INTO places
          (id, family_id, created_by_user_id, name, lat, lng, radius_m, type, status, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
       ).run(id, user.family_id, user.id, name, lat, lng, radius, type, nowIso());
-      return send(res, 201, { place: placePublic(db.prepare('SELECT * FROM places WHERE id = ?').get(id)) });
+      return send(res, 201, { place: placePublic(await db.prepare('SELECT * FROM places WHERE id = ?').get(id)) });
     }
 
     if (req.method === 'POST' && pathname === '/places/suggest') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       if (user.role !== 'kid') return send(res, 403, { error: 'Solo un hijo/a puede sugerir lugares.' });
       const body = await readBody(req);
@@ -2249,40 +2286,40 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: 'Falta la ubicación del lugar.' });
       }
       const id = uuid();
-      db.prepare(
+      await db.prepare(
         `INSERT INTO places
          (id, family_id, created_by_user_id, name, lat, lng, radius_m, type, suggested_by_kid_id, status, created_at)
          VALUES (?, ?, ?, ?, ?, ?, 60, 'favorite', ?, 'pending_approval', ?)`,
       ).run(id, user.family_id, user.id, name, lat, lng, user.id, nowIso());
-      createEvent({
+      await createEvent({
         kid: user,
         type: 'place_suggested',
         placeId: id,
         forceNotify: true,
       });
-      return send(res, 201, { place: placePublic(db.prepare('SELECT * FROM places WHERE id = ?').get(id)) });
+      return send(res, 201, { place: placePublic(await db.prepare('SELECT * FROM places WHERE id = ?').get(id)) });
     }
 
     if (req.method === 'POST' && /^\/places\/[^/]+\/approve$/.test(pathname)) {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       if (!isAdultRole(user.role)) return send(res, 403, { error: 'Solo un adulto puede aprobar.' });
       const placeId = pathname.split('/')[2];
-      const place = db
+      const place = await db
         .prepare('SELECT * FROM places WHERE id = ? AND family_id = ?')
         .get(placeId, user.family_id);
       if (!place) return send(res, 404, { error: 'No encontramos ese lugar.' });
-      db.prepare(`UPDATE places SET status = 'active' WHERE id = ?`).run(placeId);
+      await db.prepare(`UPDATE places SET status = 'active' WHERE id = ?`).run(placeId);
       if (place.suggested_by_kid_id) {
-        const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(place.suggested_by_kid_id);
+        const kid = await db.prepare('SELECT * FROM users WHERE id = ?').get(place.suggested_by_kid_id);
         if (kid) {
-          const { event } = createEvent({
+          const { event } = await createEvent({
             kid,
             type: 'place_approved',
             placeId,
             forceNotify: false,
           });
-          notifyKidUser(
+          await notifyKidUser(
             kid.id,
             'Lugar aceptado',
             `Ya podés usar “${place.name}” en Llegué`,
@@ -2290,28 +2327,28 @@ const server = http.createServer(async (req, res) => {
           );
         }
       }
-      return send(res, 200, { place: placePublic(db.prepare('SELECT * FROM places WHERE id = ?').get(placeId)) });
+      return send(res, 200, { place: placePublic(await db.prepare('SELECT * FROM places WHERE id = ?').get(placeId)) });
     }
 
     if (req.method === 'DELETE' && pathname.startsWith('/places/')) {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       if (!isAdultRole(user.role)) return send(res, 403, { error: 'Solo un adulto puede borrar lugares.' });
       const placeId = pathname.slice('/places/'.length).split('/')[0];
-      const place = db
+      const place = await db
         .prepare('SELECT * FROM places WHERE id = ? AND family_id = ?')
         .get(placeId, user.family_id);
       if (!place) return send(res, 404, { error: 'No encontramos ese lugar.' });
       // Soft-delete: evita fallar por rutinas/eventos vinculados
-      db.prepare(`DELETE FROM routines WHERE place_id = ?`).run(placeId);
-      db.prepare(
+      await db.prepare(`DELETE FROM routines WHERE place_id = ?`).run(placeId);
+      await db.prepare(
         `UPDATE places SET status = 'deleted' WHERE id = ?`,
       ).run(placeId);
       return send(res, 200, { ok: true });
     }
 
     if (req.method === 'PATCH' && pathname.startsWith('/places/')) {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       if (!isAdultRole(user.role)) {
         return send(res, 403, { error: 'Solo un adulto puede editar lugares.' });
@@ -2320,7 +2357,7 @@ const server = http.createServer(async (req, res) => {
       if (placeId.includes('/')) {
         // /places/:id/approve ya se maneja arriba
       }
-      const place = db
+      const place = await db
         .prepare(`SELECT * FROM places WHERE id = ? AND family_id = ? AND status != 'deleted'`)
         .get(placeId, user.family_id);
       if (!place) return send(res, 404, { error: 'No encontramos ese lugar.' });
@@ -2339,29 +2376,29 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
         return send(res, 400, { error: 'Falta la ubicación del lugar.' });
       }
-      db.prepare(
+      await db.prepare(
         `UPDATE places SET name = ?, lat = ?, lng = ?, type = ?, radius_m = ? WHERE id = ?`,
       ).run(name, lat, lng, type, radius, placeId);
       return send(res, 200, {
-        place: placePublic(db.prepare('SELECT * FROM places WHERE id = ?').get(placeId)),
+        place: placePublic(await db.prepare('SELECT * FROM places WHERE id = ?').get(placeId)),
       });
     }
 
     // ROUTINES
     if (req.method === 'GET' && pathname === '/routines') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       const kidId = url.searchParams.get('kidId') || (user.role === 'kid' ? user.id : null);
       if (!kidId) return send(res, 400, { error: 'Indicá de qué hijo/a querés ver las rutinas.' });
-      const kid = db.prepare('SELECT * FROM users WHERE id = ? AND family_id = ?').get(kidId, user.family_id);
+      const kid = await db.prepare('SELECT * FROM users WHERE id = ? AND family_id = ?').get(kidId, user.family_id);
       if (!kid) return send(res, 404, { error: 'No encontramos a esa persona.' });
       if (user.role === 'kid' && user.id !== kidId) {
         return send(res, 403, { error: 'Solo podés ver tus rutinas.' });
       }
-      const rows = db
+      const rows = (await db
         .prepare('SELECT * FROM routines WHERE kid_id = ? ORDER BY created_at DESC')
         .all(kidId)
-        .map((r) => ({
+      ).map((r) => ({
           id: r.id,
           kidId: r.kid_id,
           placeId: r.place_id,
@@ -2376,15 +2413,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/routines') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       if (!isAdultRole(user.role)) return send(res, 403, { error: 'Solo un adulto puede crear rutinas.' });
       const body = await readBody(req);
-      const kid = db
+      const kid = await db
         .prepare(`SELECT * FROM users WHERE id = ? AND family_id = ? AND role = 'kid'`)
         .get(body.kidId, user.family_id);
       if (!kid) return send(res, 404, { error: 'Elegí un hijo/a de la familia.' });
-      const place = db
+      const place = await db
         .prepare(`SELECT * FROM places WHERE id = ? AND family_id = ? AND status = 'active'`)
         .get(body.placeId, user.family_id);
       if (!place) return send(res, 404, { error: 'Elegí un lugar guardado.' });
@@ -2393,12 +2430,12 @@ const server = http.createServer(async (req, res) => {
       const startTime = String(body.startTime ?? '08:00').slice(0, 5);
       const endTime = String(body.endTime ?? '13:00').slice(0, 5);
       const id = uuid();
-      db.prepare(
+      await db.prepare(
         `INSERT INTO routines
          (id, kid_id, place_id, label, days_of_week, start_time, end_time, active, created_by_user_id, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
       ).run(id, kid.id, place.id, label, JSON.stringify(days), startTime, endTime, user.id, nowIso());
-      const r = db.prepare('SELECT * FROM routines WHERE id = ?').get(id);
+      const r = await db.prepare('SELECT * FROM routines WHERE id = ?').get(id);
       return send(res, 201, {
         routine: {
           id: r.id,
@@ -2415,37 +2452,37 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'DELETE' && pathname.startsWith('/routines/')) {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id || !isAdultRole(user.role)) {
         return send(res, 403, { error: 'Solo un adulto puede borrar rutinas.' });
       }
       const routineId = pathname.slice('/routines/'.length);
-      const r = db.prepare('SELECT * FROM routines WHERE id = ?').get(routineId);
+      const r = await db.prepare('SELECT * FROM routines WHERE id = ?').get(routineId);
       if (!r) return send(res, 404, { error: 'No encontramos esa rutina.' });
-      const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(r.kid_id);
+      const kid = await db.prepare('SELECT * FROM users WHERE id = ?').get(r.kid_id);
       if (!kid || kid.family_id !== user.family_id) {
         return send(res, 403, { error: 'No podés borrar esa rutina.' });
       }
-      db.prepare(`DELETE FROM routines WHERE id = ?`).run(routineId);
+      await db.prepare(`DELETE FROM routines WHERE id = ?`).run(routineId);
       return send(res, 200, { ok: true });
     }
 
     if (req.method === 'PATCH' && pathname.startsWith('/routines/')) {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id || !isAdultRole(user.role)) {
         return send(res, 403, { error: 'Solo un adulto puede editar rutinas.' });
       }
       const routineId = pathname.slice('/routines/'.length);
-      const r = db.prepare('SELECT * FROM routines WHERE id = ?').get(routineId);
+      const r = await db.prepare('SELECT * FROM routines WHERE id = ?').get(routineId);
       if (!r) return send(res, 404, { error: 'No encontramos esa rutina.' });
-      const kidOfRoutine = db.prepare('SELECT * FROM users WHERE id = ?').get(r.kid_id);
+      const kidOfRoutine = await db.prepare('SELECT * FROM users WHERE id = ?').get(r.kid_id);
       if (!kidOfRoutine || kidOfRoutine.family_id !== user.family_id) {
         return send(res, 403, { error: 'No podés editar esa rutina.' });
       }
       const body = await readBody(req);
       let kidId = r.kid_id;
       if (body.kidId) {
-        const kid = db
+        const kid = await db
           .prepare(`SELECT * FROM users WHERE id = ? AND family_id = ? AND role = 'kid'`)
           .get(body.kidId, user.family_id);
         if (!kid) return send(res, 404, { error: 'Elegí un hijo/a de la familia.' });
@@ -2453,13 +2490,13 @@ const server = http.createServer(async (req, res) => {
       }
       let placeId = r.place_id;
       if (body.placeId) {
-        const place = db
+        const place = await db
           .prepare(`SELECT * FROM places WHERE id = ? AND family_id = ? AND status = 'active'`)
           .get(body.placeId, user.family_id);
         if (!place) return send(res, 404, { error: 'Elegí un lugar guardado.' });
         placeId = place.id;
       }
-      const place = db.prepare('SELECT * FROM places WHERE id = ?').get(placeId);
+      const place = await db.prepare('SELECT * FROM places WHERE id = ?').get(placeId);
       const label =
         body.label != null ? String(body.label).trim() : r.label || place?.name || 'Rutina';
       const days = Array.isArray(body.daysOfWeek)
@@ -2474,7 +2511,7 @@ const server = http.createServer(async (req, res) => {
       const active =
         body.active == null ? r.active : body.active === false || body.active === 0 ? 0 : 1;
       if (label.length < 1) return send(res, 400, { error: 'Poné un nombre a la rutina.' });
-      db.prepare(
+      await db.prepare(
         `UPDATE routines
          SET kid_id = ?, place_id = ?, label = ?, days_of_week = ?, start_time = ?, end_time = ?, active = ?
          WHERE id = ?`,
@@ -2488,7 +2525,7 @@ const server = http.createServer(async (req, res) => {
         active,
         routineId,
       );
-      const updated = db.prepare('SELECT * FROM routines WHERE id = ?').get(routineId);
+      const updated = await db.prepare('SELECT * FROM routines WHERE id = ?').get(routineId);
       return send(res, 200, {
         routine: {
           id: updated.id,
@@ -2506,16 +2543,16 @@ const server = http.createServer(async (req, res) => {
 
     // ALERT PREFS
     if (req.method === 'GET' && pathname === '/alert-prefs') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       if (!isAdultRole(user.role)) {
         return send(res, 403, { error: 'Solo los adultos configuran avisos.' });
       }
-      return send(res, 200, { prefs: getAlertPrefs(user.id) });
+      return send(res, 200, { prefs: await getAlertPrefs(user.id) });
     }
 
     if (req.method === 'PUT' && pathname === '/alert-prefs') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       if (!isAdultRole(user.role)) {
         return send(res, 403, { error: 'Solo los adultos configuran avisos.' });
@@ -2527,47 +2564,47 @@ const server = http.createServer(async (req, res) => {
         if (incoming[key] === undefined) continue;
         const enabled = incoming[key] === false || incoming[key] === 0 ? 0 : 1;
         if (key === 'panic') {
-          db.prepare(
+          await db.prepare(
             `INSERT INTO alert_prefs (user_id, event_type, enabled) VALUES (?, ?, 1)
              ON CONFLICT(user_id, event_type) DO UPDATE SET enabled = 1`,
           ).run(user.id, key);
           continue;
         }
-        db.prepare(
+        await db.prepare(
           `INSERT INTO alert_prefs (user_id, event_type, enabled) VALUES (?, ?, ?)
            ON CONFLICT(user_id, event_type) DO UPDATE SET enabled = excluded.enabled`,
         ).run(user.id, key, enabled);
       }
-      return send(res, 200, { prefs: getAlertPrefs(user.id) });
+      return send(res, 200, { prefs: await getAlertPrefs(user.id) });
     }
 
     // TRIPS
     if (req.method === 'GET' && pathname === '/trips/active') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       const kidId = url.searchParams.get('kidId') || (user.role === 'kid' ? user.id : null);
       if (!kidId) return send(res, 400, { error: 'Indicá el hijo/a.' });
-      const kid = db.prepare('SELECT * FROM users WHERE id = ? AND family_id = ?').get(kidId, user.family_id);
+      const kid = await db.prepare('SELECT * FROM users WHERE id = ? AND family_id = ?').get(kidId, user.family_id);
       if (!kid) return send(res, 404, { error: 'No encontramos a esa persona.' });
-      const trip = db
+      const trip = await db
         .prepare(`SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC LIMIT 1`)
         .get(kidId);
       return send(res, 200, { trip: trip ? tripPublic(trip) : null });
     }
 
     if (req.method === 'POST' && pathname === '/trips') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       const body = await readBody(req);
       const kidId = user.role === 'kid' ? user.id : body.kidId;
-      const kid = db
+      const kid = await db
         .prepare(`SELECT * FROM users WHERE id = ? AND family_id = ? AND role = 'kid'`)
         .get(kidId, user.family_id);
       if (!kid) return send(res, 404, { error: 'Solo se pueden registrar salidas de un hijo/a.' });
       if (user.role === 'kid' && user.id !== kid.id) {
         return send(res, 403, { error: 'Solo podés avisar tu propia salida.' });
       }
-      const existing = db
+      const existing = await db
         .prepare(`SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue')`)
         .get(kid.id);
       if (existing) {
@@ -2575,16 +2612,16 @@ const server = http.createServer(async (req, res) => {
       }
       let dest = null;
       if (body.destinationPlaceId) {
-        dest = db
+        dest = await db
           .prepare(`SELECT * FROM places WHERE id = ? AND family_id = ? AND status = 'active'`)
           .get(body.destinationPlaceId, user.family_id);
         if (!dest) return send(res, 404, { error: 'Ese lugar no está disponible.' });
       }
       const id = uuid();
       const expected = body.expectedReturnAt ? String(body.expectedReturnAt) : null;
-      const home = familyHomePlace(user.family_id);
+      const home = await familyHomePlace(user.family_id);
       const phase = dest?.id ? 'pending_departure' : null;
-      db.prepare(
+      await db.prepare(
         `INSERT INTO trips
          (id, kid_id, origin_place_id, destination_place_id, status, expected_return_at, started_at, created_at, phase, departed_at, created_by_user_id, created_by_name)
          VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL, ?, ?)`,
@@ -2600,13 +2637,13 @@ const server = http.createServer(async (req, res) => {
         user.id,
         user.name,
       );
-      const trip = db.prepare('SELECT * FROM trips WHERE id = ?').get(id);
+      const trip = await db.prepare('SELECT * FROM trips WHERE id = ?').get(id);
       // Solo crea el viaje. Cero push familiar de “salió”: el primer aviso es EXIT Casa.
       let notifiedCount = 0;
       if (isAdultRole(user.role)) {
         const destIsHome = dest?.type === 'home';
         const destLabel = dest?.name ? ` a ${dest.name}` : '';
-        notifiedCount = notifyKidUser(
+        notifiedCount = await notifyKidUser(
           kid.id,
           'Salida especial',
           destIsHome || String(body.kind ?? '') === 'walking_home'
@@ -2618,15 +2655,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'PATCH' && pathname.startsWith('/trips/')) {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       const rest = pathname.slice('/trips/'.length);
       const parts = rest.split('/').filter(Boolean);
       const tripId = parts[0];
       const pathAction = parts[1];
-      const trip = db.prepare('SELECT * FROM trips WHERE id = ?').get(tripId);
+      const trip = await db.prepare('SELECT * FROM trips WHERE id = ?').get(tripId);
       if (!trip) return send(res, 404, { error: 'No encontramos esa salida.' });
-      const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(trip.kid_id);
+      const kid = await db.prepare('SELECT * FROM users WHERE id = ?').get(trip.kid_id);
       if (!kid || kid.family_id !== user.family_id) {
         return send(res, 403, { error: 'No podés cambiar esa salida.' });
       }
@@ -2637,13 +2674,13 @@ const server = http.createServer(async (req, res) => {
       const action = pathAction === 'cancel' ? 'cancel' : body.action || body.status;
       if (action === 'cancel' || action === 'cancelled') {
         if (trip.status === 'cancelled') {
-          const again = cancelTripRecord(trip);
+          const again = await cancelTripRecord(trip);
           return send(res, 200, { trip: tripPublic(again) });
         }
         if (!['active', 'overdue'].includes(trip.status)) {
           return send(res, 400, { error: 'Esa salida ya terminó.' });
         }
-        const updated = cancelTripRecord(trip);
+        const updated = await cancelTripRecord(trip);
         return send(res, 200, { trip: tripPublic(updated) });
       }
       if (action === 'update' || action === 'edit') {
@@ -2655,7 +2692,7 @@ const server = http.createServer(async (req, res) => {
           if (body.destinationPlaceId == null || body.destinationPlaceId === '') {
             destId = null;
           } else {
-            const dest = db
+            const dest = await db
               .prepare(`SELECT * FROM places WHERE id = ? AND family_id = ? AND status = 'active'`)
               .get(body.destinationPlaceId, user.family_id);
             if (!dest) return send(res, 404, { error: 'Ese lugar no está disponible.' });
@@ -2666,18 +2703,18 @@ const server = http.createServer(async (req, res) => {
         if (Object.prototype.hasOwnProperty.call(body, 'expectedReturnAt')) {
           expected = body.expectedReturnAt ? String(body.expectedReturnAt) : null;
         }
-        db.prepare(
+        await db.prepare(
           `UPDATE trips SET destination_place_id = ?, expected_return_at = ? WHERE id = ?`,
         ).run(destId, expected, tripId);
         return send(res, 200, {
-          trip: tripPublic(db.prepare('SELECT * FROM trips WHERE id = ?').get(tripId)),
+          trip: tripPublic(await db.prepare('SELECT * FROM trips WHERE id = ?').get(tripId)),
         });
       }
       if (action === 'arrive' || action === 'arrived') {
         if (!['active', 'overdue'].includes(trip.status)) {
           return send(res, 400, { error: 'Esa salida ya terminó.' });
         }
-        const { event, notifiedCount } = createEvent({
+        const { event, notifiedCount } = await createEvent({
           kid,
           type: 'arrival',
           placeId: trip.destination_place_id,
@@ -2685,10 +2722,10 @@ const server = http.createServer(async (req, res) => {
           forceNotify: true,
         });
         // Marcado manual: cierra igual (ENTER destino de una especial no cierra solo).
-        db.prepare(
+        await db.prepare(
           `UPDATE trips SET status = 'arrived', ended_at = COALESCE(ended_at, ?) WHERE id = ? AND status IN ('active','overdue')`,
         ).run(nowIso(), tripId);
-        const updated = db.prepare('SELECT * FROM trips WHERE id = ?').get(tripId);
+        const updated = await db.prepare('SELECT * FROM trips WHERE id = ?').get(tripId);
         return send(res, 200, { trip: tripPublic(updated), event, notifiedCount });
       }
       return send(res, 400, { error: 'Acción no reconocida.' });
@@ -2696,7 +2733,7 @@ const server = http.createServer(async (req, res) => {
 
     // EVENTS
     if (req.method === 'POST' && pathname === '/events') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       const body = await readBody(req);
       const type = String(body.type ?? '');
@@ -2726,7 +2763,7 @@ const server = http.createServer(async (req, res) => {
             error: 'Solo se registran llegadas y salidas del hijo/a.',
           });
         }
-        kid = db
+        kid = await db
           .prepare(`SELECT * FROM users WHERE id = ? AND family_id = ? AND role = 'kid'`)
           .get(body.kidId, user.family_id);
         if (!kid) return send(res, 404, { error: 'No encontramos a ese hijo/a.' });
@@ -2742,7 +2779,7 @@ const server = http.createServer(async (req, res) => {
         payloadIn.place_name ??
         null;
       if (placeId || placeName) {
-        const found = lookupFamilyPlace(user.family_id, placeId, placeName, {
+        const found = await lookupFamilyPlace(user.family_id, placeId, placeName, {
           includeInactive: type === 'arrival' || type === 'departure',
         });
         if (found) {
@@ -2757,13 +2794,13 @@ const server = http.createServer(async (req, res) => {
 
       let tripId = body.tripId ?? null;
       if (!tripId && (type === 'arrival' || type === 'departure')) {
-        const active = db
+        const active = await db
           .prepare(`SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue')`)
           .get(kid.id);
         tripId = active?.id ?? null;
       }
 
-      const result = createEvent({
+      const result = await createEvent({
         kid,
         type,
         placeId,
@@ -2775,13 +2812,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && pathname === '/events') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
       const since = url.searchParams.get('since');
       const kidId = url.searchParams.get('kidId');
       let rows;
       if (user.role === 'kid') {
-        rows = db
+        rows = await db
           .prepare(
             since
               ? `SELECT * FROM events WHERE kid_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 50`
@@ -2791,13 +2828,13 @@ const server = http.createServer(async (req, res) => {
       } else {
         const kids = kidId
           ? [kidId]
-          : db
+          : (await db
               .prepare(`SELECT id FROM users WHERE family_id = ? AND role = 'kid'`)
               .all(user.family_id)
-              .map((k) => k.id);
+            ).map((k) => k.id);
         if (kids.length === 0) return send(res, 200, { events: [] });
         const placeholders = kids.map(() => '?').join(',');
-        rows = db
+        rows = await db
           .prepare(
             since
               ? `SELECT * FROM events WHERE kid_id IN (${placeholders}) AND created_at >= ? ORDER BY created_at DESC LIMIT 50`
@@ -2809,14 +2846,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && pathname === '/notifications/me') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
-      const rows = db
+      const rows = (await db
         .prepare(
           `SELECT * FROM notifications WHERE recipient_user_id = ? ORDER BY created_at DESC LIMIT 40`,
         )
         .all(user.id)
-        .map((n) => ({
+      ).map((n) => ({
           id: n.id,
           eventId: n.event_id,
           status: n.status,
@@ -2829,77 +2866,78 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && pathname === '/family/status') {
-      const user = authUser(req);
+      const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
-      const family = db.prepare('SELECT * FROM families WHERE id = ?').get(user.family_id);
-      const members = db
+      const family = await db.prepare('SELECT * FROM families WHERE id = ?').get(user.family_id);
+      const memberRows = await db
         .prepare('SELECT * FROM users WHERE family_id = ? ORDER BY created_at ASC')
-        .all(user.family_id)
-        .map((m) => {
-          const device = db
-            .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
-            .get(m.id);
-          const activeTrip =
-            m.role === 'kid'
-              ? db
-                  .prepare(
-                    `SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC LIMIT 1`,
-                  )
-                  .get(m.id)
-              : null;
-          const lastEvent =
-            m.role === 'kid'
-              ? db
-                  .prepare(
-                    `SELECT * FROM events WHERE kid_id = ? ORDER BY created_at DESC LIMIT 1`,
-                  )
-                  .get(m.id)
-              : null;
-          let healthIssue = null;
-          if (!device) healthIssue = 'Sin celular registrado';
-          else if (device.location_permission === 'denied') healthIssue = 'Ubicación apagada';
-          else if (device.notifications_permission === 'denied') healthIssue = 'Sin avisos';
-          else if (device.location_ok === 0) healthIssue = 'GPS cortado';
-          else if (!device.permissions_completed_at) healthIssue = 'Falta permiso';
-          else if (new Date(device.last_seen_at) < new Date(Date.now() - 30 * 60 * 1000)) {
-            healthIssue = 'Sin señal reciente';
+        .all(user.family_id);
+      const members = [];
+      for (const m of memberRows) {
+        const device = await db
+          .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
+          .get(m.id);
+        const activeTrip =
+          m.role === 'kid'
+            ? await db
+                .prepare(
+                  `SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC LIMIT 1`,
+                )
+                .get(m.id)
+            : null;
+        const lastEvent =
+          m.role === 'kid'
+            ? await db
+                .prepare(
+                  `SELECT * FROM events WHERE kid_id = ? ORDER BY created_at DESC LIMIT 1`,
+                )
+                .get(m.id)
+            : null;
+        let healthIssue = null;
+        if (!device) healthIssue = 'Sin celular registrado';
+        else if (device.location_permission === 'denied') healthIssue = 'Ubicación apagada';
+        else if (device.notifications_permission === 'denied') healthIssue = 'Sin avisos';
+        else if (Number(device.location_ok) === 0) healthIssue = 'GPS cortado';
+        else if (!device.permissions_completed_at) healthIssue = 'Falta permiso';
+        else if (new Date(device.last_seen_at) < new Date(Date.now() - 30 * 60 * 1000)) {
+          healthIssue = 'Sin señal reciente';
+        }
+        const presence = await memberPresence(m, lastEvent, activeTrip, healthIssue);
+        let tripOut = null;
+        if (activeTrip) {
+          tripOut = tripPublic(activeTrip);
+          if (activeTrip.destination_place_id) {
+            const dest = await db
+              .prepare('SELECT name, type FROM places WHERE id = ?')
+              .get(activeTrip.destination_place_id);
+            tripOut.destinationName = dest?.name ?? null;
+            tripOut.destinationType = dest?.type ?? null;
           }
-          const presence = memberPresence(m, lastEvent, activeTrip, healthIssue);
-          let tripOut = null;
-          if (activeTrip) {
-            tripOut = tripPublic(activeTrip);
-            if (activeTrip.destination_place_id) {
-              const dest = db
-                .prepare('SELECT name, type FROM places WHERE id = ?')
-                .get(activeTrip.destination_place_id);
-              tripOut.destinationName = dest?.name ?? null;
-              tripOut.destinationType = dest?.type ?? null;
-            }
-          }
-          return {
-            ...userPublic(m),
-            permissionsReady: Boolean(device?.permissions_completed_at),
-            locationPermission: device?.location_permission ?? 'not_asked',
-            notificationsPermission: device?.notifications_permission ?? 'not_asked',
-            healthIssue,
-            activeTrip: tripOut,
-            lastEvent: lastEvent ? eventPublic(lastEvent) : null,
-            ...presence,
-          };
+        }
+        members.push({
+          ...userPublic(m),
+          permissionsReady: Boolean(device?.permissions_completed_at),
+          locationPermission: device?.location_permission ?? 'not_asked',
+          notificationsPermission: device?.notifications_permission ?? 'not_asked',
+          healthIssue,
+          activeTrip: tripOut,
+          lastEvent: lastEvent ? eventPublic(lastEvent) : null,
+          ...presence,
         });
-      const places = db
+      }
+      const places = (await db
         .prepare(`SELECT * FROM places WHERE family_id = ? AND status = 'active' ORDER BY created_at DESC`)
         .all(user.family_id)
-        .map(placePublic);
+      ).map(placePublic);
       const pendingPlaces = isAdultRole(user.role)
-        ? db
+        ? (await db
             .prepare(
               `SELECT * FROM places WHERE family_id = ? AND status = 'pending_approval' ORDER BY created_at DESC`,
             )
             .all(user.family_id)
-            .map(placePublic)
+          ).map(placePublic)
         : [];
-      const recentEvents = db
+      const recentEvents = (await db
         .prepare(
           `SELECT e.* FROM events e
            JOIN users u ON u.id = e.kid_id
@@ -2907,22 +2945,22 @@ const server = http.createServer(async (req, res) => {
            ORDER BY e.created_at DESC LIMIT 20`,
         )
         .all(user.family_id)
-        .map(eventPublic);
+      ).map(eventPublic);
       // Adultos: todos sus avisos. Hijo/a: solo aceptaciones (lugar / salida armada).
-      const myNotifications = db
+      const myNotifications = (await db
         .prepare(
           `SELECT * FROM notifications WHERE recipient_user_id = ? ORDER BY created_at DESC LIMIT 20`,
         )
         .all(user.id)
-        .map((n) => ({
-          id: n.id,
-          eventId: n.event_id,
-          status: n.status,
-          title: n.title,
-          body: n.body,
-          sentAt: n.sent_at,
-          createdAt: n.created_at,
-        }));
+      ).map((n) => ({
+        id: n.id,
+        eventId: n.event_id,
+        status: n.status,
+        title: n.title,
+        body: n.body,
+        sentAt: n.sent_at,
+        createdAt: n.created_at,
+      }));
       return send(res, 200, {
         family: { id: family.id, name: family.name, createdAt: family.created_at },
         members,
@@ -2951,29 +2989,60 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Llegué API v2 en http://localhost:${PORT}`);
-  console.log('Dejá esta ventana abierta.');
-  if (seedInfo) {
-    console.log('(SEED_FAMILIA activo — solo desarrollo)');
-  }
-  // Primera pasada al arrancar (no esperar 1 minuto).
+async function runJobs(label) {
   try {
-    checkDelayedTrips();
-    checkReturnPrompts();
-    checkRoutineDelays();
-    checkDeviceHealthAlerts();
+    await checkDelayedTrips();
+    await checkReturnPrompts();
+    await checkRoutineDelays();
+    await checkDeviceHealthAlerts();
   } catch (e) {
-    console.error('jobs_boot', e);
+    console.error(label, e);
   }
-  setInterval(() => {
-    try {
-      checkDelayedTrips();
-      checkReturnPrompts();
-      checkRoutineDelays();
-      checkDeviceHealthAlerts();
-    } catch (e) {
-      console.error('jobs', e);
+}
+
+async function main() {
+  db = await openDatabase();
+  await ensureSchema(db);
+  try {
+    if ((process.env.SEED_FAMILIA ?? 'false') === 'true') {
+      seedInfo = await seedFamilia(db);
+      console.log(
+        `Seed familia: ${seedInfo.familyName} · ` +
+          `${seedInfo.adultName} (${seedInfo.adultPhone}) · ` +
+          `${seedInfo.kidName} (${seedInfo.kidPhone})`,
+      );
     }
+  } catch (e) {
+    console.error('Seed familia falló:', e.message || e);
+  }
+
+  await new Promise((resolve) => {
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`Llegué API v2 en http://localhost:${PORT}`);
+      console.log('Dejá esta ventana abierta.');
+      console.log(`DB: ${db.dialect}${db.persistent ? ' (persistente)' : ' (solo local / efímera en Render)'}`);
+      if (seedInfo) {
+        console.log('(SEED_FAMILIA activo — solo desarrollo)');
+      }
+      resolve();
+    });
+  });
+
+  await runJobs('jobs_boot');
+  setInterval(() => {
+    runJobs('jobs');
   }, 60 * 1000);
+}
+
+function shutdown() {
+  Promise.resolve(db?.close?.())
+    .catch(() => {})
+    .finally(() => process.exit(0));
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
 });
