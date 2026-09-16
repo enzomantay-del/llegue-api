@@ -1,18 +1,20 @@
-﻿Llegué Android — build de descarga
+﻿Llegue Android - build de descarga
 ==================================
 versionName: 1.0.0
-versionCode / build: 2
+versionCode / build: 3
 fecha: 2026-09-16
-fuente: enzomantay-del/llegue-mobile @ main (incluye PR #6 sesión persistente)
+fuente: enzomantay-del/llegue-mobile @ main (fix invitar + sesion)
 
-IMPORTANTE — reinstalar
-- Instalá esta APK en el celular del ADULTO y en el del MENOR
-  (actualizar encima de la versión anterior).
-- Si no reinstalan ambos, la sesión / geocerca de salida especial
-  puede comportarse distinto entre uno y otro.
+IMPORTANTE - reinstalar
+- Instala esta APK en el celular del ADULTO y en el del MENOR
+  (actualizar encima de la version anterior).
+- Si la sesion anterior fallaba al invitar, con esta + API
+  ya deployada (/auth/refresh) el adulto puede invitar de nuevo.
 
-Contiene (respecto a builds viejos):
-- Sesión persistente (refresh; no vuelve a onboarding por cerrar la app o fallos de red)
-- Geocerca del destino en salidas especiales (avisos de llegada al Super/Modista, etc.)
+Contiene:
+- Fix invitar: refresh de sesion + mensajes claros de rol
+- CTA invitar solo para adultos
+- Sesion persistente y geocerca destino (builds anteriores)
 
-No cambia lógica del servidor en este PR: solo reemplaza public/Llegue.apk.
+Servidor: https://llegue-api.onrender.com ya tiene POST /auth/refresh.
+Descarga: https://llegue-api.onrender.com/download/llegue.apk
