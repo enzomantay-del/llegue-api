@@ -103,6 +103,7 @@ async function run() {
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'llegue-persist-'));
   const dbPath = path.join(tmp, 'llegue.db');
   try {
+    let familyName = '';
     const port1 = await getFreePort();
     const base1 = `http://127.0.0.1:${port1}`;
     const first = startServer({ port: port1, dbPath });
@@ -112,9 +113,12 @@ async function run() {
       assert(health.db?.dialect === 'sqlite', 'dialect sqlite en local');
 
       const adult = await login(base1, '5493743483429', 'test-install-adult-persist01');
-      assert(adult.family?.name, `familia al login: ${JSON.stringify(adult)}`);
+      assert(adult.user?.familyId, `familyId al login: ${JSON.stringify(adult)}`);
       assert(adult.refreshToken, 'refresh token emitido');
-      const familyName = adult.family.name;
+      const me = await api(base1, 'GET', '/auth/me', { token: adult.accessToken });
+      assert(me.status === 200, `/auth/me: ${JSON.stringify(me.json)}`);
+      assert(me.json.family?.name, 'familia en /auth/me');
+      familyName = me.json.family.name;
       const status = await api(base1, 'GET', '/family/status', { token: adult.accessToken });
       assert(status.status === 200, `status: ${JSON.stringify(status.json)}`);
       assert(status.json.family?.name === familyName, 'familia en /family/status');
@@ -142,7 +146,9 @@ async function run() {
     try {
       await waitHealth(base2);
       const adult2 = await login(base2, '5493743483429', 'test-install-adult-persist01');
-      assert(adult2.family?.name, `familia tras restart: ${JSON.stringify(adult2)}`);
+      assert(adult2.user?.familyId, `familyId tras restart: ${JSON.stringify(adult2)}`);
+      const me2 = await api(base2, 'GET', '/auth/me', { token: adult2.accessToken });
+      assert(me2.json.family?.name === familyName, 'familia sigue tras restart');
       const status2 = await api(base2, 'GET', '/family/status', { token: adult2.accessToken });
       assert(status2.status === 200, `status2: ${JSON.stringify(status2.json)}`);
       assert(status2.json.members?.length >= 2, 'miembros siguen después del restart');
