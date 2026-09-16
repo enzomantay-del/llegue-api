@@ -1917,6 +1917,42 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (req.method === 'POST' && pathname === '/auth/refresh') {
+      const body = await readBody(req);
+      const token = String(body.refreshToken ?? '').trim();
+      if (token.length < 10) {
+        return send(res, 400, { error: 'Falta el refresh token.' });
+      }
+      try {
+        const payload = verifyJwt(token, JWT_REFRESH);
+        if (payload.typ !== 'refresh') {
+          return send(res, 401, { error: 'Sesión inválida.' });
+        }
+        const hash = hashToken(token);
+        const stored = db
+          .prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?')
+          .get(hash);
+        if (
+          !stored ||
+          stored.user_id !== payload.sub ||
+          new Date(stored.expires_at) < new Date()
+        ) {
+          return send(res, 401, { error: 'Sesión inválida.' });
+        }
+        const user = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.sub);
+        if (!user) {
+          return send(res, 401, { error: 'Sesión inválida.' });
+        }
+        db.prepare('DELETE FROM refresh_tokens WHERE id = ?').run(stored.id);
+        return send(res, 200, {
+          user: userPublic(user),
+          ...issueTokens(user),
+        });
+      } catch {
+        return send(res, 401, { error: 'Sesión vencida.' });
+      }
+    }
+
     if (req.method === 'GET' && pathname === '/auth/me') {
       const user = authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
@@ -2084,8 +2120,20 @@ const server = http.createServer(async (req, res) => {
     // INVITATIONS
     if (req.method === 'POST' && pathname === '/invitations') {
       const user = authUser(req);
-      if (!user?.family_id || (user.role !== 'admin_adult' && user.role !== 'adult')) {
-        return send(res, 403, { error: 'Solo un adulto de la familia puede invitar.' });
+      // Sin sesión válida → 401 (la app puede refrescar token). No mezclar con 403 de rol.
+      if (!user) {
+        return send(res, 401, { error: 'Tenés que iniciar sesión.' });
+      }
+      if (!user.family_id) {
+        return send(res, 400, {
+          error: 'Todavía no estás en una familia. Creá o aceptá una invitación primero.',
+        });
+      }
+      // Cualquier adulto (titular u otro) puede invitar; solo menores no.
+      if (!isAdultRole(user.role)) {
+        return send(res, 403, {
+          error: 'Solo un adulto de la familia puede invitar. Tu sesión no es de adulto.',
+        });
       }
       const body = await readBody(req);
       const name = String(body.name ?? '').trim();
