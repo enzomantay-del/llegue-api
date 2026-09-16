@@ -176,6 +176,15 @@ CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipien
   if (!cols.includes('app_background_at')) {
     db.exec(`ALTER TABLE devices ADD COLUMN app_background_at TEXT`);
   }
+  if (!cols.includes('last_lat')) {
+    db.exec(`ALTER TABLE devices ADD COLUMN last_lat REAL`);
+  }
+  if (!cols.includes('last_lng')) {
+    db.exec(`ALTER TABLE devices ADD COLUMN last_lng REAL`);
+  }
+  if (!cols.includes('last_inside_place_id')) {
+    db.exec(`ALTER TABLE devices ADD COLUMN last_inside_place_id TEXT`);
+  }
   const userCols = db.prepare(`PRAGMA table_info(users)`).all().map((c) => c.name);
   if (!userCols.includes('email')) {
     db.exec(`ALTER TABLE users ADD COLUMN email TEXT`);
@@ -206,10 +215,12 @@ CREATE TABLE IF NOT EXISTS account_profiles (
 );
 `);
 
-  // Radio más preciso: defaults viejos (100 / 120 m del seed) → 60 m
+  // Radio más preciso en casa/colegio. Destino de especial NO se achica:
+  // 60 m no alcanza si el pin queda en la vereda y el menor entra al Super.
   try {
     db.prepare(
-      `UPDATE places SET radius_m = 60 WHERE radius_m IN (100, 120)`,
+      `UPDATE places SET radius_m = 60
+       WHERE radius_m IN (100, 120) AND type IN ('home', 'school')`,
     ).run();
   } catch {
     // tabla todavía no existe en installs muy viejas
