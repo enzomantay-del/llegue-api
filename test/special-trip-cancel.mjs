@@ -92,6 +92,8 @@ async function run() {
       ...process.env,
       PORT: String(port),
       LLEGUE_DB_PATH: dbPath,
+      DATABASE_URL: '',
+      NODE_ENV: 'development',
       SEED_FAMILIA: 'true',
       OTP_DEV_CODE: '123456',
       JWT_SECRET: 'test-cancel-secret',

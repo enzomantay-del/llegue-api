@@ -1,8 +1,4 @@
-/** Tablas Fase 2 — se puede llamar al arrancar para migrar DBs viejas. */
-export function ensureSchema(db) {
-  db.exec(`
-PRAGMA journal_mode = WAL;
-
+const DDL = `
 CREATE TABLE IF NOT EXISTS families (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -15,6 +11,7 @@ CREATE TABLE IF NOT EXISTS users (
   role TEXT NOT NULL,
   name TEXT NOT NULL,
   phone TEXT UNIQUE,
+  email TEXT,
   pin_hash TEXT,
   birth_date TEXT,
   relationship_label TEXT,
@@ -50,6 +47,8 @@ CREATE TABLE IF NOT EXISTS devices (
   last_seen_at TEXT NOT NULL,
   battery_level INTEGER,
   location_ok INTEGER NOT NULL DEFAULT 1,
+  app_state TEXT NOT NULL DEFAULT 'unknown',
+  app_background_at TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
@@ -145,12 +144,6 @@ CREATE TABLE IF NOT EXISTS notifications (
   FOREIGN KEY (recipient_user_id) REFERENCES users(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_users_family ON users(family_id);
-CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_codes(phone);
-CREATE INDEX IF NOT EXISTS idx_places_family ON places(family_id);
-CREATE INDEX IF NOT EXISTS idx_routines_kid ON routines(kid_id);
-CREATE INDEX IF NOT EXISTS idx_trips_kid_status ON trips(kid_id, status);
-CREATE INDEX IF NOT EXISTS idx_events_kid_created ON events(kid_id, created_at);
 CREATE TABLE IF NOT EXISTS alert_prefs (
   user_id TEXT NOT NULL,
   event_type TEXT NOT NULL,
@@ -159,39 +152,6 @@ CREATE TABLE IF NOT EXISTS alert_prefs (
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipient_user_id, created_at);
-`);
-
-  // Migración suave para DBs creadas antes de install_id / location_ok
-  const cols = db.prepare(`PRAGMA table_info(devices)`).all().map((c) => c.name);
-  if (!cols.includes('install_id')) {
-    db.exec(`ALTER TABLE devices ADD COLUMN install_id TEXT`);
-  }
-  if (!cols.includes('location_ok')) {
-    db.exec(`ALTER TABLE devices ADD COLUMN location_ok INTEGER NOT NULL DEFAULT 1`);
-  }
-  if (!cols.includes('app_state')) {
-    db.exec(`ALTER TABLE devices ADD COLUMN app_state TEXT NOT NULL DEFAULT 'unknown'`);
-  }
-  if (!cols.includes('app_background_at')) {
-    db.exec(`ALTER TABLE devices ADD COLUMN app_background_at TEXT`);
-  }
-  const userCols = db.prepare(`PRAGMA table_info(users)`).all().map((c) => c.name);
-  if (!userCols.includes('email')) {
-    db.exec(`ALTER TABLE users ADD COLUMN email TEXT`);
-  }
-  try {
-    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
-  } catch {
-    // índice ya existe o hay duplicados nulos
-  }
-  try {
-    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_install ON devices(install_id)`);
-  } catch {
-    // índice ya existe
-  }
-
-  db.exec(`
 CREATE TABLE IF NOT EXISTS account_profiles (
   user_id TEXT PRIMARY KEY,
   plan TEXT NOT NULL DEFAULT 'free',
@@ -204,35 +164,82 @@ CREATE TABLE IF NOT EXISTS account_profiles (
   updated_at TEXT NOT NULL,
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
-`);
+
+CREATE INDEX IF NOT EXISTS idx_users_family ON users(family_id);
+CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_codes(phone);
+CREATE INDEX IF NOT EXISTS idx_places_family ON places(family_id);
+CREATE INDEX IF NOT EXISTS idx_routines_kid ON routines(kid_id);
+CREATE INDEX IF NOT EXISTS idx_trips_kid_status ON trips(kid_id, status);
+CREATE INDEX IF NOT EXISTS idx_events_kid_created ON events(kid_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipient_user_id, created_at);
+`;
+
+function splitStatements(sql) {
+  return sql
+    .split(';')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+async function execStatements(db, sql) {
+  if (db.dialect === 'sqlite') {
+    await db.exec(sql);
+    return;
+  }
+  for (const stmt of splitStatements(sql)) {
+    await db.exec(stmt);
+  }
+}
+
+async function addColumn(db, table, definition) {
+  try {
+    await db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (!/duplicate column|already exists/i.test(msg)) throw e;
+  }
+}
+
+async function tryIndex(db, sql) {
+  try {
+    await db.exec(sql);
+  } catch {
+    // índice ya existe o hay duplicados nulos
+  }
+}
+
+/** Tablas Fase 2 — se puede llamar al arrancar para migrar DBs viejas. */
+export async function ensureSchema(db) {
+  if (db.dialect === 'sqlite') {
+    await db.exec('PRAGMA journal_mode = WAL;');
+  }
+
+  await execStatements(db, DDL);
+
+  // Migración suave para DBs creadas antes de columnas nuevas
+  await addColumn(db, 'devices', 'install_id TEXT');
+  await addColumn(db, 'devices', 'location_ok INTEGER NOT NULL DEFAULT 1');
+  await addColumn(db, 'devices', `app_state TEXT NOT NULL DEFAULT 'unknown'`);
+  await addColumn(db, 'devices', 'app_background_at TEXT');
+  await addColumn(db, 'users', 'email TEXT');
+  await addColumn(db, 'trips', 'phase TEXT');
+  await addColumn(db, 'trips', 'departed_at TEXT');
+  await addColumn(db, 'trips', 'created_by_user_id TEXT');
+  await addColumn(db, 'trips', 'created_by_name TEXT');
+
+  await tryIndex(db, `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
+  await tryIndex(db, `CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_install ON devices(install_id)`);
 
   // Radio más preciso: defaults viejos (100 / 120 m del seed) → 60 m
   try {
-    db.prepare(
-      `UPDATE places SET radius_m = 60 WHERE radius_m IN (100, 120)`,
-    ).run();
+    await db.prepare(`UPDATE places SET radius_m = 60 WHERE radius_m IN (100, 120)`).run();
   } catch {
     // tabla todavía no existe en installs muy viejas
   }
 
-  // Salida especial: fase y hora real de salida (DBs viejas)
-  const tripCols = db.prepare(`PRAGMA table_info(trips)`).all().map((c) => c.name);
-  if (!tripCols.includes('phase')) {
-    db.exec(`ALTER TABLE trips ADD COLUMN phase TEXT`);
-  }
-  if (!tripCols.includes('departed_at')) {
-    db.exec(`ALTER TABLE trips ADD COLUMN departed_at TEXT`);
-  }
-  if (!tripCols.includes('created_by_user_id')) {
-    db.exec(`ALTER TABLE trips ADD COLUMN created_by_user_id TEXT`);
-  }
-  if (!tripCols.includes('created_by_name')) {
-    db.exec(`ALTER TABLE trips ADD COLUMN created_by_name TEXT`);
-  }
-
   // Especiales canceladas: si el destino no es casa/colegio ni tiene rutina, dejar de monitorearlo.
   try {
-    db.exec(`
+    await db.exec(`
       UPDATE places SET status = 'inactive'
       WHERE status = 'active'
         AND type NOT IN ('home', 'school')

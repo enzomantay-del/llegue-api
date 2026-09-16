@@ -6,12 +6,23 @@ https://github.com/enzomantay-del/llegue-api
 1) https://dashboard.render.com/web/new
 2) Conectá GitHub → repo llegue-api
 3) Runtime: Docker · Plan: Free · Branch: main
-4) Variables:
+4) Base de datos persistente (obligatorio):
+   - Neon: https://console.neon.tech → Create project → copiá Connection string
+   - o Render → New → PostgreSQL y copiá Internal/External Database URL
+   Pegala en el Web Service como DATABASE_URL
+   (Neon/Supabase: terminá en ?sslmode=require)
+5) Variables:
+   NODE_ENV=production
+   DATABASE_URL=postgresql://…
+   JWT_SECRET=(generado una vez, no lo cambies)
+   JWT_REFRESH_SECRET=(generado una vez, no lo cambies)
    OTP_DEV_CODE=123456
    OTP_EXPOSE_DEV_CODE=false
    SEED_FAMILIA=false
    INVITE_PUBLIC_BASE_URL=https://TU-SERVICIO.onrender.com
-5) Create Web Service → esperá "Live"
-6) Copiá la URL https://….onrender.com y avisá para actualizar la APK
+6) Create Web Service → esperá "Live"
+7) Proba https://….onrender.com/health → ok:true y db.dialect=postgres
+8) Copiá la URL y avisá para actualizar la APK
 
-Plan gratis: puede dormirse; la 1ª apertura tarda ~30–60 s.
+Plan gratis: el servicio puede dormirse; la 1ª apertura tarda ~30–60 s.
+El disco de Render Free se borra: por eso la familia vive en Postgres, no en llegue.db.
