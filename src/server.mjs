@@ -10,10 +10,28 @@ import { seedFamilia } from './seed-familia.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
-// En Render: LLEGUE_DB_PATH=/var/data/llegue.db (disco persistente).
-// Sin eso, cada redeploy borra la familia.
-const dbPath = process.env.LLEGUE_DB_PATH || path.join(root, 'data', 'llegue.db');
+// En Render: disco en /var/data (LLEGUE_DB_PATH o auto-detect).
+// Sin disco persistente, cada redeploy borra la familia.
+function resolveDbPath() {
+  const fromEnv = (process.env.LLEGUE_DB_PATH || '').trim();
+  if (fromEnv) return fromEnv;
+  const diskDir = '/var/data';
+  try {
+    if (fs.existsSync(diskDir)) {
+      fs.accessSync(diskDir, fs.constants.W_OK);
+      return path.join(diskDir, 'llegue.db');
+    }
+  } catch {
+    // sin disco montado
+  }
+  return path.join(root, 'data', 'llegue.db');
+}
+const dbPath = resolveDbPath();
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+const dbLooksPersistent =
+  dbPath === '/var/data/llegue.db' ||
+  dbPath.startsWith('/var/data/') ||
+  Boolean((process.env.LLEGUE_DB_PATH || '').trim());
 
 /** APK oficial: GitHub Releases (no hace falta redeploy de la API al actualizar la app). */
 const APK_DOWNLOAD_URL = (
@@ -1700,7 +1718,8 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok: true,
         service: 'llegue-api-v2',
-        dbPersistent: Boolean(process.env.LLEGUE_DB_PATH),
+        dbPersistent: dbLooksPersistent,
+        dbPath: dbLooksPersistent ? '/var/data/llegue.db' : 'ephemeral',
         users,
       });
     }
