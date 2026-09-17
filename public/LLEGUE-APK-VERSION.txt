@@ -3,16 +3,14 @@
 versionName: 1.0.0
 versionCode / build: 6
 fecha: 2026-09-17
-fuente: enzomantay-del/llegue-mobile + llegue-api (fix sharing/places + iconos menor)
 
-IMPORTANTE - actualizar (NO desinstalar)
-- Instala ENCIMA. No desinstales.
-- En Cuenta debe decir: Version 1.0.0 (6)
+Descarga oficial (GitHub Releases — no redeploya la API):
+https://github.com/enzomantay-del/llegue-mobile/releases/latest/download/Llegue.apk
 
-Contiene:
-- Fix falso aviso dejo de compartir
-- Fix agregar lugar (auth 401/familia)
-- Iconos en home del menor
+También: https://llegue-api.onrender.com/download/llegue.apk
+(redirige al Release de arriba)
 
-Descarga: https://llegue-api.onrender.com/download/llegue.apk
-Probar: https://llegue-api.onrender.com/probar
+IMPORTANTE
+- Instalá ENCIMA. No desinstales.
+- La familia vive en el servidor (disco persistente). Actualizar el APK
+  ya no debe borrar lugares/rutinas/familia.

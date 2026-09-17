@@ -10,9 +10,16 @@ import { seedFamilia } from './seed-familia.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
-const dataDir = path.join(root, 'data');
-const dbPath = process.env.LLEGUE_DB_PATH || path.join(dataDir, 'llegue.db');
-fs.mkdirSync(dataDir, { recursive: true });
+// En Render: LLEGUE_DB_PATH=/var/data/llegue.db (disco persistente).
+// Sin eso, cada redeploy borra la familia.
+const dbPath = process.env.LLEGUE_DB_PATH || path.join(root, 'data', 'llegue.db');
+fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
+/** APK oficial: GitHub Releases (no hace falta redeploy de la API al actualizar la app). */
+const APK_DOWNLOAD_URL = (
+  process.env.APK_DOWNLOAD_URL ||
+  'https://github.com/enzomantay-del/llegue-mobile/releases/latest/download/Llegue.apk'
+).trim();
 
 // Cargar .env simple
 const envPath = path.join(root, '.env');
@@ -1619,7 +1626,7 @@ li{margin-bottom:8px}
 </ol>
 <div class="box">Código de prueba:<br/><strong>${otpCode}</strong></div>
 <a class="btn" href="${downloadUrl}">Descargar / actualizar Llegué</a>
-<p class="note">Usá siempre este link oficial. Un archivo viejo llamado “Llegue-v2” puede no traer los cambios nuevos.</p>
+<p class="note">La familia vive en el servidor. Las actualizaciones de la app ya no reinician ese servidor. Instalá siempre encima, sin desinstalar.</p>
 </main></body></html>`;
 }
 
@@ -1664,7 +1671,7 @@ function findApkPath() {
 function readApkVersionLabel() {
   try {
     const p = path.join(root, 'public', 'LLEGUE-APK-VERSION.txt');
-    if (!fs.existsSync(p)) return '1.0.0+5';
+    if (!fs.existsSync(p)) return '1.0.0+6';
     const text = fs.readFileSync(p, 'utf8');
     const name = text.match(/versionName:\s*(\S+)/i)?.[1];
     const code = text.match(/versionCode\s*\/\s*build:\s*(\S+)/i)?.[1];
@@ -1673,7 +1680,7 @@ function readApkVersionLabel() {
   } catch {
     // ignore
   }
-  return '1.0.0+5';
+  return '1.0.0+6';
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1684,7 +1691,18 @@ const server = http.createServer(async (req, res) => {
     const { pathname } = url;
 
     if (req.method === 'GET' && pathname === '/health') {
-      return send(res, 200, { ok: true, service: 'llegue-api-v2' });
+      let users = null;
+      try {
+        users = db.prepare('SELECT COUNT(*) AS n FROM users').get()?.n ?? 0;
+      } catch {
+        users = null;
+      }
+      return send(res, 200, {
+        ok: true,
+        service: 'llegue-api-v2',
+        dbPersistent: Boolean(process.env.LLEGUE_DB_PATH),
+        users,
+      });
     }
 
     if (req.method === 'GET' && (pathname === '/' || pathname === '/probar')) {
@@ -1702,10 +1720,19 @@ const server = http.createServer(async (req, res) => {
       (req.method === 'GET' || req.method === 'HEAD') &&
       (pathname === '/download/llegue.apk' || pathname === '/app.apk')
     ) {
+      // Preferir GitHub Releases: actualizar la app NO redeploya la API ni toca la DB.
+      if (APK_DOWNLOAD_URL && /^https?:\/\//i.test(APK_DOWNLOAD_URL)) {
+        res.writeHead(302, {
+          location: APK_DOWNLOAD_URL,
+          'access-control-allow-origin': '*',
+          'cache-control': 'no-store',
+        });
+        return res.end();
+      }
       const apk = findApkPath();
       if (!apk) {
         return send(res, 404, {
-          error: 'Todavía no hay APK en el servidor. Generá Llegue.apk en public/.',
+          error: 'Todavía no hay APK. Publicá un Release en llegue-mobile o poné public/Llegue.apk.',
         });
       }
       const data = fs.readFileSync(apk);

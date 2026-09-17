@@ -1,0 +1,34 @@
+PERSISTENCIA DE DATOS (familia / lugares / rutinas)
+==================================================
+
+Problema que teníamos
+---------------------
+La familia vive en SQLite en Render. Cada vez que subíamos un APK
+nuevo al repo de la API, Render redeployaba el servidor y el disco
+efímero se borraba → había que armar la familia de nuevo.
+
+Qué hicimos
+-----------
+1) APK se publica en GitHub Releases (llegue-mobile).
+   /download/llegue.apk redirige ahí → actualizar la app NO toca la API.
+2) Disco persistente en Render: /var/data/llegue.db
+   (render.yaml plan starter + disk).
+
+Qué tenés que revisar en Render (una sola vez)
+----------------------------------------------
+1. Dashboard → llegue-api → Disks
+   - Mount path: /var/data
+   - Size: 1 GB
+2. Environment:
+   - LLEGUE_DB_PATH = /var/data/llegue.db
+   - APK_DOWNLOAD_URL = https://github.com/enzomantay-del/llegue-mobile/releases/latest/download/Llegue.apk
+   - JWT_SECRET y JWT_REFRESH_SECRET: NO regenerar (si cambian, todas las sesiones caen)
+3. Si el plan Free no deja disco: pasá a Starter (~USD 7/mes) o el disco no sobrevive.
+
+Cómo publicar una app nueva (sin borrar datos)
+----------------------------------------------
+1. Build APK en llegue-mobile
+2. gh release create vX.Y.Z+N ./Llegue.apk --repo enzomantay-del/llegue-mobile
+3. NO merges de “release/apk” al repo llegue-api (salvo cambios de servidor)
+
+Al instalar: siempre ENCIMA, nunca desinstalar.
