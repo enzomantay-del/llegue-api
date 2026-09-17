@@ -373,11 +373,45 @@ function deviceEverFullyShared(device) {
   return Boolean(device?.permissions_completed_at);
 }
 
+/** La app manda while_in_use; a veces quedó whileInUse en DB. Unificar. */
+function normalizeLocationPermission(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return 'not_asked';
+  if (s === 'while_in_use' || s === 'whileInUse') return 'while_in_use';
+  if (s === 'always' || s === 'denied' || s === 'not_asked') return s;
+  return s;
+}
+
 function deviceSharingHealthy(device) {
   return (
-    device?.location_permission === 'always' &&
+    normalizeLocationPermission(device?.location_permission) === 'always' &&
     Number(device?.location_ok) === 1
   );
+}
+
+function devicePermissionStoppedSharing(device) {
+  const loc = normalizeLocationPermission(device?.location_permission);
+  return loc === 'denied' || loc === 'while_in_use' || Number(device?.location_ok) === 0;
+}
+
+/** Último evento de presencia real (geocerca / viaje), no ruido de batería/heartbeat. */
+function lastPresenceEvent(kidId) {
+  return db
+    .prepare(
+      `SELECT * FROM events
+       WHERE kid_id = ?
+         AND type IN (
+           'arrival','departure','return_prompt','walking_home','going_to',
+           'delay','panic','im_ok'
+         )
+       ORDER BY created_at DESC LIMIT 1`,
+    )
+    .get(kidId);
+}
+
+function touchKidDevicesLastSeen(kidId) {
+  if (!kidId) return;
+  db.prepare(`UPDATE devices SET last_seen_at = ? WHERE user_id = ?`).run(nowIso(), kidId);
 }
 
 function findInvitation(tokenOrCode) {
@@ -736,6 +770,15 @@ function applySpecialTripGeofence(activeTrip, type, place) {
         ).run(nowIso(), activeTrip.id);
         return;
       }
+      // Llegó a otro lugar de la familia (ej. Plazoleta) antes del destino:
+      // cuenta como “ya salió de Casa” para no bloquear la vuelta.
+      if (!arrivedHome && place?.id) {
+        db.prepare(
+          `UPDATE trips SET phase = CASE WHEN phase IS NULL OR phase = 'pending_departure' THEN 'en_route' ELSE phase END,
+           departed_at = COALESCE(departed_at, ?)
+           WHERE id = ? AND status IN ('active','overdue')`,
+        ).run(nowIso(), activeTrip.id);
+      }
       if (arrivedHome) {
         db.prepare(
           `UPDATE trips SET status = 'arrived', ended_at = ? WHERE id = ? AND status IN ('active','overdue')`,
@@ -1088,9 +1131,9 @@ function notifyKidUser(kidId, title, body, eventId = null, data = null) {
 }
 
 function checkDeviceHealthAlerts() {
-  // Solo si el menor YA compartía bien y después deja de (permisos/GPS/heartbeat).
-  // No avisar por invitación pendiente, onboarding incompleto o “nunca compartió”.
-  const staleBefore = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  // “Dejó de compartir” SOLO si cortó permisos/GPS de verdad.
+  // App en segundo plano sin heartbeat frecuente ≠ dejó de compartir.
+  // (last_seen viejo solo afecta el label “Sin señales recientes” en /family/status.)
   const devices = db
     .prepare(
       `SELECT d.*, u.name AS user_name, u.role AS user_role, u.family_id
@@ -1102,13 +1145,14 @@ function checkDeviceHealthAlerts() {
          AND (
            d.location_permission = 'denied'
            OR d.location_permission = 'whileInUse'
+           OR d.location_permission = 'while_in_use'
            OR d.location_ok = 0
-           OR d.last_seen_at < ?
          )`,
     )
-    .all(staleBefore);
+    .all();
 
   for (const d of devices) {
+    if (!devicePermissionStoppedSharing(d)) continue;
     const kid = db.prepare('SELECT * FROM users WHERE id = ?').get(d.user_id);
     if (!kid) continue;
     const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
@@ -1222,15 +1266,27 @@ function createEvent({
     if (place) resolvedPlaceId = place.id;
   }
 
-  // Casa ENTER mientras la especial todavía no salió: no avisar ni cerrar.
+  // Casa ENTER al armar especial (sigue en casa, sin haber salido): no avisar.
+  // Si ya hubo llegada a OTRO lugar desde que arrancó el viaje, SÍ es vuelta a Casa.
   if (
     type === 'arrival' &&
     isPlannedSpecialTrip(activeTrip) &&
     place?.type === 'home' &&
     !specialTripLeftHome(activeTrip)
   ) {
-    applySpecialTripGeofence(activeTrip, type, place);
-    return { event: null, notifiedCount: 0, place: placePublic(place), ignored: true };
+    const leftEvidence = db
+      .prepare(
+        `SELECT id FROM events
+         WHERE kid_id = ? AND type = 'arrival'
+           AND place_id IS NOT NULL AND place_id != ?
+           AND created_at >= ?
+         LIMIT 1`,
+      )
+      .get(kid.id, place.id, activeTrip.started_at || activeTrip.created_at);
+    if (!leftEvidence) {
+      applySpecialTripGeofence(activeTrip, type, place);
+      return { event: null, notifiedCount: 0, place: placePublic(place), ignored: true };
+    }
   }
 
   // Anti-duplicados: mismo tipo+lugar en los últimos 90s (después de resolver el lugar)
@@ -1276,6 +1332,11 @@ function createEvent({
     nowIso(),
   );
   const event = db.prepare('SELECT * FROM events WHERE id = ?').get(id);
+
+  // Geocerca viva = el menor sigue compartiendo (aunque la app esté en background).
+  if (type === 'arrival' || type === 'departure') {
+    touchKidDevicesLastSeen(kid.id);
+  }
 
   applySpecialTripGeofence(activeTrip, type, place);
   if (type === 'arrival' && !isPlannedSpecialTrip(activeTrip)) {
@@ -1477,12 +1538,16 @@ function memberPresence(m, lastEvent, activeTrip, healthIssue) {
     const p = db.prepare('SELECT * FROM places WHERE id = ?').get(lastEvent.place_id);
     placeName = p?.name ?? null;
   }
-  if (activeTrip?.destination_place_id) {
+
+  // No pisar el lugar del último ENTER/EXIT con el destino del viaje:
+  // eso dejaba “En Casa” arriba y “llegó a Plazoleta” abajo.
+  const tripDestName = (() => {
+    if (!activeTrip?.destination_place_id) return null;
     const p = db
       .prepare('SELECT * FROM places WHERE id = ?')
       .get(activeTrip.destination_place_id);
-    if (p?.name) placeName = p.name;
-  }
+    return p?.name ?? null;
+  })();
 
   const needsGoHome =
     Boolean(activeTrip) &&
@@ -1500,30 +1565,8 @@ function memberPresence(m, lastEvent, activeTrip, healthIssue) {
       needsGoHome,
     };
   }
-  if (activeTrip && activeTrip.phase !== 'pending_departure') {
-    if (activeTrip.status === 'overdue') {
-      return {
-        presenceStatus: 'alert',
-        presenceLabel: placeName ? `Se demora · ${placeName}` : 'Se demora',
-        currentPlaceName: placeName,
-        needsGoHome: true,
-      };
-    }
-    if (activeTrip.phase === 'at_destination') {
-      return {
-        presenceStatus: 'at_place',
-        presenceLabel: placeName ? `En ${placeName}` : 'Llegó',
-        currentPlaceName: placeName,
-        needsGoHome: false,
-      };
-    }
-    return {
-      presenceStatus: 'on_trip',
-      presenceLabel: placeName ? `En camino a ${placeName}` : 'En camino',
-      currentPlaceName: placeName,
-      needsGoHome,
-    };
-  }
+
+  // Fuente de verdad de presencia: último arrival/departure (geocerca).
   if (lastType === 'arrival') {
     return {
       presenceStatus: 'at_place',
@@ -1533,11 +1576,59 @@ function memberPresence(m, lastEvent, activeTrip, healthIssue) {
     };
   }
   if (lastType === 'departure' || lastType === 'return_prompt') {
+    if (activeTrip && activeTrip.status === 'overdue') {
+      const demoraPlace = tripDestName || placeName;
+      return {
+        presenceStatus: 'alert',
+        presenceLabel: demoraPlace ? `Se demora · ${demoraPlace}` : 'Se demora',
+        currentPlaceName: demoraPlace,
+        needsGoHome: true,
+      };
+    }
+    if (
+      activeTrip &&
+      activeTrip.phase !== 'pending_departure' &&
+      activeTrip.phase !== 'at_destination'
+    ) {
+      const dest = tripDestName;
+      return {
+        presenceStatus: 'on_trip',
+        presenceLabel: dest ? `En camino a ${dest}` : 'En camino',
+        currentPlaceName: dest,
+        needsGoHome,
+      };
+    }
     return {
       presenceStatus: 'on_trip',
       presenceLabel: placeName ? `Salió de ${placeName}` : 'Salió',
       currentPlaceName: placeName,
       needsGoHome: true,
+    };
+  }
+
+  // Sin geocerca reciente: viaje especial aún puede orientar.
+  if (activeTrip && activeTrip.phase !== 'pending_departure') {
+    if (activeTrip.status === 'overdue') {
+      return {
+        presenceStatus: 'alert',
+        presenceLabel: tripDestName ? `Se demora · ${tripDestName}` : 'Se demora',
+        currentPlaceName: tripDestName,
+        needsGoHome: true,
+      };
+    }
+    if (activeTrip.phase === 'at_destination') {
+      return {
+        presenceStatus: 'at_place',
+        presenceLabel: tripDestName ? `En ${tripDestName}` : 'Llegó',
+        currentPlaceName: tripDestName,
+        needsGoHome: false,
+      };
+    }
+    return {
+      presenceStatus: 'on_trip',
+      presenceLabel: tripDestName ? `En camino a ${tripDestName}` : 'En camino',
+      currentPlaceName: tripDestName,
+      needsGoHome,
     };
   }
   if (lastType === 'im_ok') {
@@ -1553,6 +1644,22 @@ function memberPresence(m, lastEvent, activeTrip, healthIssue) {
       presenceStatus: 'alert',
       presenceLabel: placeName ? `Demora · ${placeName}` : 'Demora',
       currentPlaceName: placeName,
+      needsGoHome: true,
+    };
+  }
+  if (lastType === 'going_to') {
+    return {
+      presenceStatus: 'on_trip',
+      presenceLabel: placeName ? `En camino a ${placeName}` : 'En camino',
+      currentPlaceName: placeName,
+      needsGoHome: false,
+    };
+  }
+  if (lastType === 'walking_home') {
+    return {
+      presenceStatus: 'on_trip',
+      presenceLabel: 'En camino a Casa',
+      currentPlaceName: 'Casa',
       needsGoHome: true,
     };
   }
@@ -2551,7 +2658,8 @@ const server = http.createServer(async (req, res) => {
         ).run(id, user.id, nowIso(), nowIso());
         device = db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
       }
-      const locationOk = body.locationPermission === 'always';
+      const locationPermission = normalizeLocationPermission(body.locationPermission);
+      const locationOk = locationPermission === 'always';
       const notifOk = body.notificationsPermission === 'granted';
       const completed = locationOk && notifOk;
       const gpsOk = body.locationOk === false ? 0 : 1;
@@ -2564,7 +2672,7 @@ const server = http.createServer(async (req, res) => {
         `UPDATE devices SET location_permission = ?, notifications_permission = ?,
          permissions_completed_at = ?, last_seen_at = ?, location_ok = ? WHERE id = ?`,
       ).run(
-        body.locationPermission,
+        locationPermission,
         body.notificationsPermission,
         nextCompletedAt,
         nowIso(),
@@ -2578,7 +2686,7 @@ const server = http.createServer(async (req, res) => {
         user.role === 'kid' &&
         user.family_id &&
         wasSharing &&
-        (!locationOk || gpsOk === 0)
+        devicePermissionStoppedSharing(updated)
       ) {
         const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
         const recent = db
@@ -3289,7 +3397,7 @@ const server = http.createServer(async (req, res) => {
                   )
                   .get(m.id)
               : null;
-          const lastEvent =
+          const lastEventRaw =
             m.role === 'kid'
               ? db
                   .prepare(
@@ -3297,22 +3405,46 @@ const server = http.createServer(async (req, res) => {
                   )
                   .get(m.id)
               : null;
-          let healthIssue = null;
-          if (!device) healthIssue = 'Todavía no está compartiendo';
+          const presenceEvent =
+            m.role === 'kid' ? lastPresenceEvent(m.id) : null;
+          let hardHealth = null;
+          let softHealth = null;
+          if (!device) hardHealth = 'Todavía no está compartiendo';
           else if (!device.permissions_completed_at) {
-            healthIssue = 'Todavía no está compartiendo';
-          } else if (device.location_permission === 'denied') {
-            healthIssue = 'Dejó de compartir ubicación';
-          } else if (device.location_permission === 'whileInUse') {
-            healthIssue = 'Dejó de compartir ubicación';
+            hardHealth = 'Todavía no está compartiendo';
+          } else if (devicePermissionStoppedSharing(device)) {
+            const loc = normalizeLocationPermission(device.location_permission);
+            if (Number(device.location_ok) === 0 && loc === 'always') {
+              hardHealth = 'GPS cortado';
+            } else {
+              hardHealth = 'Dejó de compartir ubicación';
+            }
           } else if (device.notifications_permission === 'denied') {
-            healthIssue = 'Sin avisos';
-          } else if (device.location_ok === 0) {
-            healthIssue = 'GPS cortado';
-          } else if (new Date(device.last_seen_at) < new Date(Date.now() - 30 * 60 * 1000)) {
-            healthIssue = 'Sin señal reciente';
+            softHealth = 'Sin avisos';
+          } else if (
+            device.last_seen_at &&
+            new Date(device.last_seen_at) < new Date(Date.now() - 30 * 60 * 1000)
+          ) {
+            softHealth = 'Hace rato no hay señales; pedile que abra Llegué';
           }
-          const presence = memberPresence(m, lastEvent, activeTrip, healthIssue);
+          const presence = memberPresence(m, presenceEvent || lastEventRaw, activeTrip, hardHealth);
+          if (
+            softHealth &&
+            !hardHealth &&
+            (!presenceEvent || presence.presenceStatus === 'unknown')
+          ) {
+            presence.presenceStatus = 'alert';
+            presence.presenceLabel = softHealth;
+          }
+          const healthIssue = hardHealth || softHealth;
+          const hardSharingStop =
+            hardHealth === 'Dejó de compartir ubicación' ||
+            hardHealth === 'GPS cortado' ||
+            hardHealth === 'Todavía no está compartiendo';
+          const lastEventForCard =
+            hardSharingStop && lastEventRaw
+              ? lastEventRaw
+              : presenceEvent || lastEventRaw;
           let tripOut = null;
           if (activeTrip) {
             tripOut = tripPublic(activeTrip);
@@ -3331,7 +3463,7 @@ const server = http.createServer(async (req, res) => {
             notificationsPermission: device?.notifications_permission ?? 'not_asked',
             healthIssue,
             activeTrip: tripOut,
-            lastEvent: lastEvent ? eventPublic(lastEvent) : null,
+            lastEvent: lastEventForCard ? eventPublic(lastEventForCard) : null,
             ...presence,
           };
         });
