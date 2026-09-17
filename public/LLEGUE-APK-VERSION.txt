@@ -1,17 +1,20 @@
 ﻿Llegue Android - build de descarga
 ==================================
 versionName: 1.0.0
-versionCode / build: 4
+versionCode / build: 5
 fecha: 2026-09-16
-fuente: enzomantay-del/llegue-mobile @ main (UX menus + iconos)
+fuente: enzomantay-del/llegue-mobile @ main
 
-IMPORTANTE - reinstalar
-- Instala esta APK en el celular del ADULTO (y menor si corresponde).
+IMPORTANTE - actualizar (NO desinstalar)
+- Si ya tenés Llegué, instalá este APK ENCIMA de la que ya está.
+- NO desinstales: si la borrás, se pierde la sesión de ese celular.
+- La familia en el servidor no se borra por actualizar el APK.
+- Confirmá en Cuenta: debe decir "Versión 1.0.0 (5)".
 
 Contiene:
-- Menu ☰ solo funciones (Inicio, Mi familia, Lugares, Rutinas, Salida especial)
-- Cuenta solo cuenta (perfil, avisos, ayuda, bases, salir)
-- 3 atajos en Inicio con iconos
-- Iconos en Ultimos avisos por tipo
+- UX menús / atajos / iconos
+- Versión visible en Cuenta
+- Mensajes claros de actualización
 
-Descarga: https://llegue-api.onrender.com/download/llegue.apk
+Descarga oficial: https://llegue-api.onrender.com/download/llegue.apk
+Probar: https://llegue-api.onrender.com/probar

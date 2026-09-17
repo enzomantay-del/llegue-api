@@ -1556,7 +1556,8 @@ ${tip}
 </main></body></html>`;
 }
 
-function trialLandingHtml({ downloadUrl, otpCode }) {
+function trialLandingHtml({ downloadUrl, otpCode, versionLabel }) {
+  const version = versionLabel || '1.0.0';
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Probar Llegué</title>
 <style>
 body{font-family:Segoe UI,system-ui,sans-serif;margin:0;min-height:100vh;background:linear-gradient(155deg,#0f3d34,#1f8a70 55%,#3d2a1a);color:#fff;display:grid;place-items:center;padding:24px}
@@ -1568,23 +1569,24 @@ ol{margin:0 0 18px;padding-left:1.2rem;color:rgba(255,255,255,.9);line-height:1.
 li{margin-bottom:8px}
 .box{background:rgba(255,255,255,.14);border-radius:14px;padding:14px 16px;margin:16px 0}
 .box strong{font-size:1.35rem;letter-spacing:.08em}
+.warn{background:rgba(232,184,109,.2);border:1px solid rgba(232,184,109,.45);border-radius:14px;padding:12px 14px;margin:14px 0;font-size:.95rem;line-height:1.45}
 .btn{display:block;text-align:center;text-decoration:none;color:#0f3d34;background:#fff;font-weight:800;padding:18px;border-radius:16px;margin-top:8px}
 .note{margin-top:16px;font-size:.9rem;color:rgba(255,255,255,.7)}
 </style></head>
 <body><main>
-<span class="tag">Prueba cerrada</span>
+<span class="tag">Prueba cerrada · ${version}</span>
 <h1>Llegué</h1>
 <p>Tranquilidad al saber que llegaron. Sin pedir que te avisen.</p>
-<p>Para probar la app en Android:</p>
+<div class="warn"><strong>Si ya tenés Llegué instalada:</strong> descargá e instalá <em>encima</em>. <strong>No desinstales</strong>: si la borrás, se pierde la sesión de este celular (la familia en el servidor sigue).</div>
+<p>Para instalar o actualizar en Android:</p>
 <ol>
-  <li>Tocá <strong>Descargar Llegué</strong> e instalá (si Android pide permiso para apps desconocidas, aceptalo).</li>
-  <li>Abrí la app, leé y aceptá las bases.</li>
-  <li>Tocá <strong>Comenzar</strong> (familia nueva) o <strong>Ya tengo cuenta</strong>.</li>
-  <li>Ingresá tu teléfono y el código de prueba de abajo.</li>
+  <li>Tocá <strong>Descargar Llegué</strong> e instalá encima de la que ya tenés.</li>
+  <li>Si es la primera vez: abrí la app, aceptá las bases y entrá con tu teléfono.</li>
+  <li>Para confirmar la actualización: Cuenta → abajo del nombre tiene que decir <strong>${version}</strong>.</li>
 </ol>
 <div class="box">Código de prueba:<br/><strong>${otpCode}</strong></div>
-<a class="btn" href="${downloadUrl}">Descargar Llegué</a>
-<p class="note">Es una versión de prueba. El código es fijo mientras dure esta etapa (aún no enviamos SMS).</p>
+<a class="btn" href="${downloadUrl}">Descargar / actualizar Llegué</a>
+<p class="note">Usá siempre este link oficial. Un archivo viejo llamado “Llegue-v2” puede no traer los cambios nuevos.</p>
 </main></body></html>`;
 }
 
@@ -1626,6 +1628,21 @@ function findApkPath() {
   return null;
 }
 
+function readApkVersionLabel() {
+  try {
+    const p = path.join(root, 'public', 'LLEGUE-APK-VERSION.txt');
+    if (!fs.existsSync(p)) return '1.0.0+5';
+    const text = fs.readFileSync(p, 'utf8');
+    const name = text.match(/versionName:\s*(\S+)/i)?.[1];
+    const code = text.match(/versionCode\s*\/\s*build:\s*(\S+)/i)?.[1];
+    if (name && code) return `${name}+${code}`;
+    if (name) return name;
+  } catch {
+    // ignore
+  }
+  return '1.0.0+5';
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') return send(res, 204, '');
@@ -1640,9 +1657,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (pathname === '/' || pathname === '/probar')) {
       const host = req.headers.host || `localhost:${PORT}`;
       const base = publicInviteBase(process.env.INVITE_PUBLIC_BASE_URL, host);
+      const versionLabel = readApkVersionLabel();
       return send(res, 200, trialLandingHtml({
         downloadUrl: `${base}/download/llegue.apk`,
         otpCode: process.env.OTP_DEV_CODE || '123456',
+        versionLabel,
       }));
     }
 
@@ -1653,14 +1672,16 @@ const server = http.createServer(async (req, res) => {
       const apk = findApkPath();
       if (!apk) {
         return send(res, 404, {
-          error: 'Todavía no hay APK en el servidor. Generá Llegue-v2.apk en la carpeta del proyecto.',
+          error: 'Todavía no hay APK en el servidor. Generá Llegue.apk en public/.',
         });
       }
       const data = fs.readFileSync(apk);
+      const versionLabel = readApkVersionLabel().replace(/\s+/g, '');
+      const fileName = `Llegue-${versionLabel || 'update'}.apk`;
       res.writeHead(200, {
         'content-type': 'application/vnd.android.package-archive',
         'content-length': data.length,
-        'content-disposition': 'attachment; filename="Llegue.apk"',
+        'content-disposition': `attachment; filename="${fileName}"`,
         'access-control-allow-origin': '*',
       });
       if (req.method === 'HEAD') return res.end();
