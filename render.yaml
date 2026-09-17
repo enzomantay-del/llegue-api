@@ -2,18 +2,26 @@ services:
   - type: web
     name: llegue-api
     runtime: docker
-    plan: free
+    plan: starter
     region: oregon
     healthCheckPath: /health
     dockerfilePath: ./Dockerfile
     dockerContext: .
+    disk:
+      name: llegue-sqlite
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
+      - key: LLEGUE_DB_PATH
+        value: /var/data/llegue.db
+      - key: APK_DOWNLOAD_URL
+        value: https://github.com/enzomantay-del/llegue-mobile/releases/latest/download/Llegue.apk
       - key: JWT_SECRET
-        generateValue: true
+        sync: false
       - key: JWT_REFRESH_SECRET
-        generateValue: true
+        sync: false
       - key: OTP_DEV_CODE
         value: "123456"
       - key: OTP_EXPOSE_DEV_CODE
