@@ -8,6 +8,6 @@
     "start": "node --experimental-sqlite src/server.mjs",
     "db:init": "node --experimental-sqlite src/db-init.mjs",
     "db:seed": "node --experimental-sqlite src/seed-familia.mjs",
-    "test": "node --experimental-sqlite test/special-trip-cancel.mjs && node --experimental-sqlite test/invite-auth-refresh.mjs"
+    "test": "node --experimental-sqlite test/special-trip-cancel.mjs && node --experimental-sqlite test/invite-auth-refresh.mjs && node --experimental-sqlite test/share-place-auth.mjs"
   }
 }
