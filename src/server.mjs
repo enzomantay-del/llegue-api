@@ -322,6 +322,39 @@ function authUser(req) {
   }
 }
 
+/** Usuario autenticado o 401. No confundir sesión vencida con “sin familia”. */
+function requireUser(req, res) {
+  const user = authUser(req);
+  if (!user) {
+    send(res, 401, { error: 'Tenés que iniciar sesión.' });
+    return null;
+  }
+  return user;
+}
+
+/** Usuario con familia o 401/400 separados. */
+function requireFamilyUser(req, res) {
+  const user = requireUser(req, res);
+  if (!user) return null;
+  if (!user.family_id) {
+    send(res, 400, { error: 'Todavía no estás en una familia.' });
+    return null;
+  }
+  return user;
+}
+
+/** Solo avisar “dejó de compartir” si alguna vez completó el compartir pleno. */
+function deviceEverFullyShared(device) {
+  return Boolean(device?.permissions_completed_at);
+}
+
+function deviceSharingHealthy(device) {
+  return (
+    device?.location_permission === 'always' &&
+    Number(device?.location_ok) === 1
+  );
+}
+
 function findInvitation(tokenOrCode) {
   const key = String(tokenOrCode).trim().toUpperCase();
   return db
@@ -1030,7 +1063,8 @@ function notifyKidUser(kidId, title, body, eventId = null, data = null) {
 }
 
 function checkDeviceHealthAlerts() {
-  // Si el menor no reporta en ~2 min, o apagó ubicación → aviso
+  // Solo si el menor YA compartía bien y después deja de (permisos/GPS/heartbeat).
+  // No avisar por invitación pendiente, onboarding incompleto o “nunca compartió”.
   const staleBefore = new Date(Date.now() - 2 * 60 * 1000).toISOString();
   const devices = db
     .prepare(
@@ -1039,11 +1073,10 @@ function checkDeviceHealthAlerts() {
        JOIN users u ON u.id = d.user_id
        WHERE u.family_id IS NOT NULL
          AND u.role = 'kid'
+         AND d.permissions_completed_at IS NOT NULL
          AND (
-           d.permissions_completed_at IS NULL
-           OR d.location_permission = 'denied'
+           d.location_permission = 'denied'
            OR d.location_permission = 'whileInUse'
-           OR d.notifications_permission = 'denied'
            OR d.location_ok = 0
            OR d.last_seen_at < ?
          )`,
@@ -2476,23 +2509,29 @@ const server = http.createServer(async (req, res) => {
       const notifOk = body.notificationsPermission === 'granted';
       const completed = locationOk && notifOk;
       const gpsOk = body.locationOk === false ? 0 : 1;
+      const wasSharing = deviceEverFullyShared(device) && deviceSharingHealthy(device);
+      // No borrar el sello de “alguna vez compartió”: si no, el heartbeat vuelve a tratarlo como onboarding.
+      const nextCompletedAt = completed
+        ? (device.permissions_completed_at || nowIso())
+        : device.permissions_completed_at;
       db.prepare(
         `UPDATE devices SET location_permission = ?, notifications_permission = ?,
          permissions_completed_at = ?, last_seen_at = ?, location_ok = ? WHERE id = ?`,
       ).run(
         body.locationPermission,
         body.notificationsPermission,
-        completed ? nowIso() : null,
+        nextCompletedAt,
         nowIso(),
         gpsOk,
         device.id,
       );
       const updated = db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id);
 
-      // Si el menor apagó ubicación o no dio “Siempre”, avisar ya a los adultos
+      // Solo si ANTES compartía bien y ahora no (no en el primer onboarding).
       if (
         user.role === 'kid' &&
         user.family_id &&
+        wasSharing &&
         (!locationOk || gpsOk === 0)
       ) {
         const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
@@ -2524,14 +2563,14 @@ const server = http.createServer(async (req, res) => {
           permissionsCompletedAt: updated.permissions_completed_at,
           lastSeenAt: updated.last_seen_at,
         },
-        permissionsReady: completed,
+        permissionsReady: Boolean(updated.permissions_completed_at) && locationOk && notifOk,
       });
     }
 
     // PLACES
     if (req.method === 'GET' && pathname === '/places') {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       const includePending = url.searchParams.get('includePending') === '1';
       const rows = db
         .prepare(
@@ -2544,8 +2583,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/places') {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       if (!isAdultRole(user.role)) {
         return send(res, 403, { error: 'Solo un adulto puede cargar lugares. Podés sugerir uno.' });
       }
@@ -2571,8 +2610,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/places/suggest') {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       if (user.role !== 'kid') return send(res, 403, { error: 'Solo un hijo/a puede sugerir lugares.' });
       const body = await readBody(req);
       const name = String(body.name ?? '').trim();
@@ -2598,8 +2637,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && /^\/places\/[^/]+\/approve$/.test(pathname)) {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       if (!isAdultRole(user.role)) return send(res, 403, { error: 'Solo un adulto puede aprobar.' });
       const placeId = pathname.split('/')[2];
       const place = db
@@ -2628,8 +2667,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'DELETE' && pathname.startsWith('/places/')) {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       if (!isAdultRole(user.role)) return send(res, 403, { error: 'Solo un adulto puede borrar lugares.' });
       const placeId = pathname.slice('/places/'.length).split('/')[0];
       const place = db
@@ -2645,8 +2684,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'PATCH' && pathname.startsWith('/places/')) {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       if (!isAdultRole(user.role)) {
         return send(res, 403, { error: 'Solo un adulto puede editar lugares.' });
       }
@@ -2683,8 +2722,8 @@ const server = http.createServer(async (req, res) => {
 
     // ROUTINES
     if (req.method === 'GET' && pathname === '/routines') {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       const kidId = url.searchParams.get('kidId') || (user.role === 'kid' ? user.id : null);
       if (!kidId) return send(res, 400, { error: 'Indicá de qué hijo/a querés ver las rutinas.' });
       const kid = db.prepare('SELECT * FROM users WHERE id = ? AND family_id = ?').get(kidId, user.family_id);
@@ -2710,8 +2749,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/routines') {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       if (!isAdultRole(user.role)) return send(res, 403, { error: 'Solo un adulto puede crear rutinas.' });
       const body = await readBody(req);
       const kid = db
@@ -2749,8 +2788,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'DELETE' && pathname.startsWith('/routines/')) {
-      const user = authUser(req);
-      if (!user?.family_id || !isAdultRole(user.role)) {
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
+      if (!isAdultRole(user.role)) {
         return send(res, 403, { error: 'Solo un adulto puede borrar rutinas.' });
       }
       const routineId = pathname.slice('/routines/'.length);
@@ -2765,8 +2805,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'PATCH' && pathname.startsWith('/routines/')) {
-      const user = authUser(req);
-      if (!user?.family_id || !isAdultRole(user.role)) {
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
+      if (!isAdultRole(user.role)) {
         return send(res, 403, { error: 'Solo un adulto puede editar rutinas.' });
       }
       const routineId = pathname.slice('/routines/'.length);
@@ -2877,8 +2918,8 @@ const server = http.createServer(async (req, res) => {
 
     // TRIPS
     if (req.method === 'GET' && pathname === '/trips/active') {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       const kidId = url.searchParams.get('kidId') || (user.role === 'kid' ? user.id : null);
       if (!kidId) return send(res, 400, { error: 'Indicá el hijo/a.' });
       const kid = db.prepare('SELECT * FROM users WHERE id = ? AND family_id = ?').get(kidId, user.family_id);
@@ -2893,8 +2934,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/trips') {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       const body = await readBody(req);
       const kidId = user.role === 'kid' ? user.id : body.kidId;
       const kid = db
@@ -2964,8 +3005,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'PATCH' && pathname.startsWith('/trips/')) {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       const rest = pathname.slice('/trips/'.length);
       const parts = rest.split('/').filter(Boolean);
       const tripId = parts[0];
@@ -3042,8 +3083,8 @@ const server = http.createServer(async (req, res) => {
 
     // EVENTS
     if (req.method === 'POST' && pathname === '/events') {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       const body = await readBody(req);
       const type = String(body.type ?? '');
       const allowed = [
@@ -3130,8 +3171,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && pathname === '/events') {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       const since = url.searchParams.get('since');
       const kidId = url.searchParams.get('kidId');
       let rows;
@@ -3184,8 +3225,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && pathname === '/family/status') {
-      const user = authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = requireFamilyUser(req, res);
+      if (!user) return;
       const family = db.prepare('SELECT * FROM families WHERE id = ?').get(user.family_id);
       const members = db
         .prepare('SELECT * FROM users WHERE family_id = ? ORDER BY created_at ASC')
@@ -3211,12 +3252,18 @@ const server = http.createServer(async (req, res) => {
                   .get(m.id)
               : null;
           let healthIssue = null;
-          if (!device) healthIssue = 'Sin celular registrado';
-          else if (device.location_permission === 'denied') healthIssue = 'Ubicación apagada';
-          else if (device.notifications_permission === 'denied') healthIssue = 'Sin avisos';
-          else if (device.location_ok === 0) healthIssue = 'GPS cortado';
-          else if (!device.permissions_completed_at) healthIssue = 'Falta permiso';
-          else if (new Date(device.last_seen_at) < new Date(Date.now() - 30 * 60 * 1000)) {
+          if (!device) healthIssue = 'Todavía no está compartiendo';
+          else if (!device.permissions_completed_at) {
+            healthIssue = 'Todavía no está compartiendo';
+          } else if (device.location_permission === 'denied') {
+            healthIssue = 'Dejó de compartir ubicación';
+          } else if (device.location_permission === 'whileInUse') {
+            healthIssue = 'Dejó de compartir ubicación';
+          } else if (device.notifications_permission === 'denied') {
+            healthIssue = 'Sin avisos';
+          } else if (device.location_ok === 0) {
+            healthIssue = 'GPS cortado';
+          } else if (new Date(device.last_seen_at) < new Date(Date.now() - 30 * 60 * 1000)) {
             healthIssue = 'Sin señal reciente';
           }
           const presence = memberPresence(m, lastEvent, activeTrip, healthIssue);
