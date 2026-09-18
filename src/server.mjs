@@ -1576,26 +1576,38 @@ function memberPresence(m, lastEvent, activeTrip, healthIssue) {
     };
   }
   if (lastType === 'departure' || lastType === 'return_prompt') {
-    if (activeTrip && activeTrip.status === 'overdue') {
-      const demoraPlace = tripDestName || placeName;
+    // EXIT de X ≠ “en camino a X”. “En camino a dest” solo si hay salida
+    // especial armada hacia otro lugar y todavía va hacia allá.
+    const headingOut =
+      isPlannedSpecialTrip(activeTrip) &&
+      specialTripHeadingOut(activeTrip) &&
+      tripDestName &&
+      tripDestName !== placeName;
+    const headingHome =
+      isPlannedSpecialTrip(activeTrip) && specialTripHeadingHome(activeTrip);
+
+    if (activeTrip && activeTrip.status === 'overdue' && headingOut) {
       return {
         presenceStatus: 'alert',
-        presenceLabel: demoraPlace ? `Se demora · ${demoraPlace}` : 'Se demora',
-        currentPlaceName: demoraPlace,
+        presenceLabel: `Se demora · ${tripDestName}`,
+        currentPlaceName: tripDestName,
         needsGoHome: true,
       };
     }
-    if (
-      activeTrip &&
-      activeTrip.phase !== 'pending_departure' &&
-      activeTrip.phase !== 'at_destination'
-    ) {
-      const dest = tripDestName;
+    if (headingOut) {
       return {
         presenceStatus: 'on_trip',
-        presenceLabel: dest ? `En camino a ${dest}` : 'En camino',
-        currentPlaceName: dest,
-        needsGoHome,
+        presenceLabel: `En camino a ${tripDestName}`,
+        currentPlaceName: tripDestName,
+        needsGoHome: false,
+      };
+    }
+    if (headingHome) {
+      return {
+        presenceStatus: 'on_trip',
+        presenceLabel: placeName ? `Salió de ${placeName}` : 'En camino a Casa',
+        currentPlaceName: placeName,
+        needsGoHome: true,
       };
     }
     return {
@@ -3109,6 +3121,19 @@ const server = http.createServer(async (req, res) => {
       if (body.destinationPlaceId && !dest) {
         return send(res, 404, { error: 'Ese lugar no está disponible.' });
       }
+      const kind = String(body.kind ?? '');
+      const wantsWalkingHome = kind === 'walking_home';
+      if (!dest && wantsWalkingHome) {
+        dest = familyHomePlace(user.family_id);
+        if (!dest) {
+          return send(res, 400, {
+            error: 'Todavía no hay un lugar Casa. Pedile a un adulto que lo agregue.',
+          });
+        }
+      }
+      if (!dest) {
+        return send(res, 400, { error: 'Elegí a dónde va la salida.' });
+      }
       const id = uuid();
       const expected = body.expectedReturnAt ? String(body.expectedReturnAt) : null;
       const home = familyHomePlace(user.family_id);
@@ -3130,15 +3155,43 @@ const server = http.createServer(async (req, res) => {
         user.name,
       );
       const trip = db.prepare('SELECT * FROM trips WHERE id = ?').get(id);
-      // Solo crea el viaje. Cero push familiar de “salió”: el primer aviso es EXIT Casa.
+      const destIsHome = dest?.type === 'home';
+      const isWalkingHome = kind === 'walking_home' || destIsHome;
+
+      // Menor avisa “Regreso a casa” / salida: crear evento + push a adultos.
+      // (Si arma un adulto, al menor le avisamos aparte; el EXIT Casa sigue siendo
+      // el aviso geográfico de “salió”.)
+      if (user.role === 'kid') {
+        const eventType = isWalkingHome ? 'walking_home' : 'going_to';
+        const created = createEvent({
+          kid: user,
+          type: eventType,
+          placeId: dest?.id ?? null,
+          tripId: id,
+          forceNotify: true,
+          payload: {
+            source: 'trip_start',
+            kind: kind || eventType,
+            destinationPlaceId: dest?.id ?? null,
+            destinationName: dest?.name ?? null,
+            createdByUserId: user.id,
+          },
+        });
+        const fresh = db.prepare('SELECT * FROM trips WHERE id = ?').get(id);
+        return send(res, 201, {
+          trip: tripPublic(fresh),
+          event: created.event,
+          notifiedCount: created.notifiedCount,
+        });
+      }
+
       let notifiedCount = 0;
       if (isAdultRole(user.role)) {
-        const destIsHome = dest?.type === 'home';
         const destLabel = dest?.name ? ` a ${dest.name}` : '';
         notifiedCount = notifyKidUser(
           kid.id,
           'Salida especial',
-          destIsHome || String(body.kind ?? '') === 'walking_home'
+          isWalkingHome
             ? 'Te armaron un regreso a casa'
             : `Te armaron una salida especial${destLabel}`,
           null,
