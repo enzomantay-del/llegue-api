@@ -2,22 +2,19 @@ services:
   - type: web
     name: llegue-api
     runtime: docker
-    plan: starter
+    plan: free
     region: oregon
     healthCheckPath: /health
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    disk:
-      name: llegue-sqlite
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
-      - key: LLEGUE_DB_PATH
-        value: /var/data/llegue.db
-      - key: APK_DOWNLOAD_URL
-        value: https://github.com/enzomantay-del/llegue-mobile/releases/latest/download/Llegue.apk
+      # Obligatorio en prod: connection string de Neon (o Supabase / Render Postgres).
+      # Pegalo en Dashboard → Environment. NO lo subas a GitHub.
+      - key: DATABASE_URL
+        sync: false
+      # Estables: si los regenerás, caen TODAS las sesiones.
       - key: JWT_SECRET
         sync: false
       - key: JWT_REFRESH_SECRET
@@ -30,3 +27,5 @@ services:
         value: "false"
       - key: INVITE_PUBLIC_BASE_URL
         sync: false
+      - key: APK_DOWNLOAD_URL
+        value: https://github.com/enzomantay-del/llegue-mobile/releases/latest/download/Llegue.apk
