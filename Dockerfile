@@ -2,7 +2,12 @@ FROM node:22-bookworm-slim
 
 WORKDIR /app
 
-COPY package.json ./
+# Instalar dependencias (pg) ANTES de copiar el código y de arrancar.
+# Sin este paso la imagen no tiene node_modules y Render crashea:
+# Cannot find package 'pg'
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
 COPY src ./src
 COPY datos-familia.json ./datos-familia.json
 COPY public ./public
