@@ -8,7 +8,8 @@
     "start": "node --experimental-sqlite src/server.mjs",
     "db:init": "node --experimental-sqlite src/db-init.mjs",
     "db:seed": "node --experimental-sqlite src/seed-familia.mjs",
-    "test": "node test/sql-pg-params.mjs && node --experimental-sqlite test/special-trip-cancel.mjs && node --experimental-sqlite test/invite-auth-refresh.mjs && node --experimental-sqlite test/share-place-auth.mjs && node --experimental-sqlite test/presence-home-sharing.mjs && node --experimental-sqlite test/presence-outing-gohome.mjs && node --experimental-sqlite test/persist-restart.mjs && node --experimental-sqlite test/device-reassign.mjs"
+    "reset-db": "node --experimental-sqlite src/reset-db.mjs",
+    "test": "node test/sql-pg-params.mjs && node --experimental-sqlite test/special-trip-cancel.mjs && node --experimental-sqlite test/invite-auth-refresh.mjs && node --experimental-sqlite test/share-place-auth.mjs && node --experimental-sqlite test/presence-home-sharing.mjs && node --experimental-sqlite test/presence-outing-gohome.mjs && node --experimental-sqlite test/persist-restart.mjs && node --experimental-sqlite test/device-reassign.mjs && node --experimental-sqlite test/reset-and-dedupe.mjs"
   },
   "dependencies": {
     "pg": "^8.22.0"

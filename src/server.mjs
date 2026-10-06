@@ -1837,7 +1837,8 @@ const server = http.createServer(async (req, res) => {
       const prod = (process.env.NODE_ENV || '') === 'production';
       let users = null;
       try {
-        users = (await db.prepare('SELECT COUNT(*) AS n FROM users').get())?.n ?? 0;
+        const raw = (await db.prepare('SELECT COUNT(*) AS n FROM users').get())?.n;
+        users = raw == null ? 0 : Number(raw);
       } catch {
         users = null;
       }
@@ -3598,7 +3599,9 @@ async function main() {
   db = await openDatabase();
   await ensureSchema(db);
   try {
-    if ((process.env.SEED_FAMILIA ?? 'false') === 'true') {
+    if (process.env.NODE_ENV === 'production') {
+      console.log('SEED_FAMILIA ignorado en producción.');
+    } else if ((process.env.SEED_FAMILIA ?? 'false') === 'true') {
       seedInfo = await seedFamilia(db);
       console.log(
         `Seed familia: ${seedInfo.familyName} ┬À ` +
