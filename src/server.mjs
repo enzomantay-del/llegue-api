@@ -975,29 +975,64 @@ async function findDeviceByInstall(installId) {
     .get(String(installId).trim());
 }
 
-/** Un celular (install_id) = un solo integrante.
- *  Si la misma persona reinstala la app, se reata el celular nuevo. */
-async function bindInstallToUser(installId, user, platform = 'android') {
+function samePersonName(a, b) {
+  return String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
+}
+
+function isPlaceholderName(name) {
+  const n = String(name ?? '').trim().toLowerCase();
+  return !n || n === 'sin nombre';
+}
+
+function deviceBoundPayload(row) {
+  return {
+    ok: false,
+    status: 409,
+    code: 'device_bound',
+    error: `Este celular estaba como ${row.user_name}.`,
+    boundUser: {
+      id: row.user_id,
+      name: row.user_name,
+      role: row.user_role,
+      phone: row.user_phone ?? null,
+    },
+  };
+}
+
+/** Saca este celular de quien lo tenía. No borra a la persona. */
+async function releaseInstallBinding(installId) {
+  const idKey = String(installId ?? '').trim();
+  if (idKey.length < 6) {
+    return { ok: false, status: 400, error: 'No pudimos identificar este celular.' };
+  }
+  const row = await findDeviceByInstall(idKey);
+  if (!row) return { ok: true, released: false };
+  await db.prepare('DELETE FROM devices WHERE id = ?').run(row.id);
+  return {
+    ok: true,
+    released: true,
+    previousUser: {
+      id: row.user_id,
+      name: row.user_name,
+      role: row.user_role,
+    },
+  };
+}
+
+/** Un celular (install_id) es de una persona hasta que confirmen el cambio.
+ *  reassign: true suelta a la persona anterior y ata a la nueva. */
+async function bindInstallToUser(installId, user, platform = 'android', opts = {}) {
+  const reassign = opts.reassign === true;
   const idKey = String(installId ?? '').trim();
   if (idKey.length < 6) {
     return { ok: false, status: 400, error: 'No pudimos identificar este celular. Reinstalá la app.' };
   }
 
-  const byInstall = await findDeviceByInstall(idKey);
+  let byInstall = await findDeviceByInstall(idKey);
   if (byInstall && byInstall.user_id !== user.id) {
-    return {
-      ok: false,
-      status: 409,
-      error:
-        `Este celular ya es de ${byInstall.user_name}. ` +
-        'Cada celular es de una sola persona de la familia. ' +
-        'Para otra persona, usá otro celular.',
-      boundUser: {
-        id: byInstall.user_id,
-        name: byInstall.user_name,
-        role: byInstall.user_role,
-      },
-    };
+    if (!reassign) return deviceBoundPayload(byInstall);
+    await db.prepare('DELETE FROM devices WHERE id = ?').run(byInstall.id);
+    byInstall = null;
   }
 
   // Misma persona con otro install (reinstaló): liberar el registro viejo
@@ -1020,6 +1055,14 @@ async function bindInstallToUser(installId, user, platform = 'android') {
      VALUES (?, ?, ?, ?, NULL, 'not_asked', 'not_asked', ?, 1, ?)`,
   ).run(deviceId, user.id, idKey, platform, nowIso(), nowIso());
   return { ok: true, deviceId };
+}
+
+function bindFailureBody(bind) {
+  return {
+    error: bind.error,
+    ...(bind.code ? { code: bind.code } : {}),
+    ...(bind.boundUser ? { boundUser: bind.boundUser } : {}),
+  };
 }
 
 async function fanOutNotifications(event, familyId, title, body, excludeUserId = null) {
@@ -1794,7 +1837,8 @@ const server = http.createServer(async (req, res) => {
       const prod = (process.env.NODE_ENV || '') === 'production';
       let users = null;
       try {
-        users = (await db.prepare('SELECT COUNT(*) AS n FROM users').get())?.n ?? 0;
+        const raw = (await db.prepare('SELECT COUNT(*) AS n FROM users').get())?.n;
+        users = raw == null ? 0 : Number(raw);
       } catch {
         users = null;
       }
@@ -1934,14 +1978,11 @@ const server = http.createServer(async (req, res) => {
       }
 
       const already = await findDeviceByInstall(installId);
-      if (already && already.user_id) {
+      if (already && already.user_id && body.reassignDevice !== true) {
         const bound = await db.prepare('SELECT * FROM users WHERE id = ?').get(already.user_id);
         if (bound && bound.phone && bound.phone !== phone) {
-          return send(res, 409, {
-            error:
-              `Este celular ya es de ${already.user_name}. ` +
-              'Cada celular es de una sola persona.',
-          });
+          const fail = deviceBoundPayload(already);
+          return send(res, fail.status, bindFailureBody(fail));
         }
       }
 
@@ -1959,8 +2000,10 @@ const server = http.createServer(async (req, res) => {
          VALUES (?, NULL, 'admin_adult', ?, ?, ?, ?, ?)`,
       ).run(id, name, phone, email, birthDate, nowIso());
       const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android');
-      if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
+      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android', {
+        reassign: body.reassignDevice === true,
+      });
+      if (!bind.ok) return send(res, bind.status, bindFailureBody(bind));
 
       await db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(phone);
       await db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(emailOtpKey(email));
@@ -1991,6 +2034,18 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (req.method === 'POST' && pathname === '/devices/release') {
+      const body = await readBody(req);
+      if (body.confirm !== true) {
+        return send(res, 400, {
+          error: 'Confirmá que este celular va a cambiar de persona.',
+        });
+      }
+      const released = await releaseInstallBinding(body.installId);
+      if (!released.ok) return send(res, released.status, { error: released.error });
+      return send(res, 200, released);
+    }
+
     if (req.method === 'POST' && pathname === '/auth/verify-otp') {
       const body = await readBody(req);
       const phone = normalizePhone(body.phone ?? '');
@@ -2003,41 +2058,33 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: 'El código no es válido o venció.' });
       }
 
-      // Si este celular ya es de otra persona, no dejar entrar con otro teléfono/rol
-      const already = await findDeviceByInstall(installId);
-      if (already && already.user_phone && already.user_phone !== phone) {
+      const reassign = body.reassignDevice === true;
+      let inv = null;
+      if (body.inviteToken) {
+        inv = await findInvitation(body.inviteToken);
+      }
+      let user = await db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
+      if (
+        inv &&
+        user &&
+        !isPlaceholderName(user.name) &&
+        !samePersonName(user.name, inv.name_hint)
+      ) {
         return send(res, 409, {
-          error:
-            `Este celular ya es de ${already.user_name}. ` +
-            'Cada celular es de una sola persona. Usá otro celular para otra persona.',
-          boundUser: {
-            id: already.user_id,
-            name: already.user_name,
-            role: already.user_role,
-          },
+          code: 'phone_owner',
+          error: `Ese número es de ${user.name}; para ${inv.name_hint} usá el número de ${inv.name_hint}.`,
+          phoneOwner: { name: user.name, role: user.role },
+          inviteName: inv.name_hint,
         });
       }
-      if (already && !already.user_phone && already.user_id) {
-        // Celular atado a hijo/a con PIN: no permitir OTP de otra persona
-        const boundUser = await db.prepare('SELECT * FROM users WHERE id = ?').get(already.user_id);
-        if (boundUser && boundUser.phone !== phone) {
-          return send(res, 409, {
-            error:
-              `Este celular ya es de ${already.user_name}. ` +
-              'Cada celular es de una sola persona. Usá otro celular para otra persona.',
-          });
-        }
+
+      const already = await findDeviceByInstall(installId);
+      if (already && already.user_id && (!user || already.user_id !== user.id) && !reassign) {
+        const fail = deviceBoundPayload(already);
+        return send(res, fail.status, bindFailureBody(fail));
       }
 
-      let user = await db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
       if (!user) {
-        if (already) {
-          return send(res, 409, {
-            error:
-              `Este celular ya es de ${already.user_name}. ` +
-              'No se puede crear otra cuenta acá. Usá otro celular.',
-          });
-        }
         const id = uuid();
         await db.prepare(
           `INSERT INTO users (id, family_id, role, name, phone, created_at)
@@ -2046,8 +2093,10 @@ const server = http.createServer(async (req, res) => {
         user = await db.prepare('SELECT * FROM users WHERE id = ?').get(id);
       }
 
-      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android');
-      if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
+      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android', {
+        reassign,
+      });
+      if (!bind.ok) return send(res, bind.status, bindFailureBody(bind));
 
       await db.prepare('DELETE FROM otp_codes WHERE phone = ?').run(phone);
       return send(res, 200, {
@@ -2071,18 +2120,15 @@ const server = http.createServer(async (req, res) => {
         return send(res, 401, { error: 'PIN incorrecto.' });
       }
 
+      const reassign = body.reassignDevice === true;
       const already = await findDeviceByInstall(installId);
-      if (already && already.user_id) {
-        // Si es otro usuario, bloquear; si es reinstalación del mismo, bindInstall lo reata
+      if (already && already.user_id && !reassign) {
         const boundUser = await db.prepare('SELECT * FROM users WHERE id = ?').get(already.user_id);
-        if (boundUser && boundUser.role === 'kid' && boundUser.name === inv.name_hint) {
-          // permitir continuar hacia bind
-        } else if (already) {
-          return send(res, 409, {
-            error:
-              `Este celular ya es de ${already.user_name}. ` +
-              'No se puede entrar como otra persona desde acá. Usá otro celular.',
-          });
+        const sameKid =
+          boundUser && boundUser.role === 'kid' && samePersonName(boundUser.name, inv.name_hint);
+        if (!sameKid) {
+          const fail = deviceBoundPayload(already);
+          return send(res, fail.status, bindFailureBody(fail));
         }
       }
 
@@ -2097,11 +2143,13 @@ const server = http.createServer(async (req, res) => {
         ).run(id, inv.family_id, inv.name_hint, inv.pin_hash, nowIso());
         user = await db.prepare('SELECT * FROM users WHERE id = ?').get(id);
       }
+      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android', {
+        reassign,
+      });
+      if (!bind.ok) return send(res, bind.status, bindFailureBody(bind));
       await db.prepare(
         `UPDATE invitations SET status = 'accepted', accepted_by_user_id = ? WHERE id = ?`,
       ).run(user.id, inv.id);
-      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android');
-      if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
       return send(res, 200, {
         user: userPublic(user),
         family: { id: inv.family_id, name: inv.family_name },
@@ -2284,8 +2332,10 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: 'Escribí el nombre de la familia y tu rol.' });
       }
       if (body.installId) {
-        const bind = await bindInstallToUser(body.installId, user, body.platform ?? 'android');
-        if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
+        const bind = await bindInstallToUser(body.installId, user, body.platform ?? 'android', {
+          reassign: body.reassignDevice === true,
+        });
+        if (!bind.ok) return send(res, bind.status, bindFailureBody(bind));
       }
       const familyId = uuid();
       await db.prepare(`INSERT INTO families (id, name, created_at) VALUES (?, ?, ?)`).run(
@@ -2403,9 +2453,19 @@ const server = http.createServer(async (req, res) => {
           return send(res, 401, { error: 'PIN incorrecto.' });
         }
       }
+      if (!isPlaceholderName(user.name) && !samePersonName(user.name, inv.name_hint)) {
+        return send(res, 409, {
+          code: 'phone_owner',
+          error: `Ese número es de ${user.name}; para ${inv.name_hint} usá el número de ${inv.name_hint}.`,
+          phoneOwner: { name: user.name, role: user.role },
+          inviteName: inv.name_hint,
+        });
+      }
 
-      const bind = await bindInstallToUser(body.installId, user, body.platform ?? 'android');
-      if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
+      const bind = await bindInstallToUser(body.installId, user, body.platform ?? 'android', {
+        reassign: body.reassignDevice === true,
+      });
+      if (!bind.ok) return send(res, bind.status, bindFailureBody(bind));
 
       await db.prepare(
         `UPDATE users SET family_id = ?, role = ?, name = ?, relationship_label = ?, pin_hash = COALESCE(?, pin_hash)
@@ -2439,8 +2499,10 @@ const server = http.createServer(async (req, res) => {
       if (!installId) {
         return send(res, 400, { error: 'Falta identificar el celular.' });
       }
-      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android');
-      if (!bind.ok) return send(res, bind.status, { error: bind.error, boundUser: bind.boundUser });
+      const bind = await bindInstallToUser(installId, user, body.platform ?? 'android', {
+        reassign: body.reassignDevice === true,
+      });
+      if (!bind.ok) return send(res, bind.status, bindFailureBody(bind));
 
       if (body.pushToken) {
         await db.prepare(`UPDATE devices SET push_token = ?, last_seen_at = ? WHERE id = ?`).run(
@@ -3537,7 +3599,9 @@ async function main() {
   db = await openDatabase();
   await ensureSchema(db);
   try {
-    if ((process.env.SEED_FAMILIA ?? 'false') === 'true') {
+    if (process.env.NODE_ENV === 'production') {
+      console.log('SEED_FAMILIA ignorado en producción.');
+    } else if ((process.env.SEED_FAMILIA ?? 'false') === 'true') {
       seedInfo = await seedFamilia(db);
       console.log(
         `Seed familia: ${seedInfo.familyName} ┬À ` +

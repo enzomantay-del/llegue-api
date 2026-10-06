@@ -6,7 +6,7 @@ import { isLocalDbUrl, isPostgresUrl, toPgParams } from './sql.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const envPath = path.join(__dirname, '..', '.env');
-if (fs.existsSync(envPath)) {
+if (process.env.RESET_IGNORE_DOTENV !== '1' && fs.existsSync(envPath)) {
   for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
     const m = line.match(/^([^#=]+)=(.*)$/);
     if (!m) continue;

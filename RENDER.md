@@ -57,3 +57,21 @@ Las próximas veces que el servidor duerma o redeploye, **no** debería borrarse
 
 Sin `DATABASE_URL`, la API usa SQLite en `data/llegue.db` (solo PC).  
 Con `DATABASE_URL` apunta a Postgres también en local.
+
+## 6. Vaciar la base una sola vez (novato)
+
+Esto borra personas, familias, lugares y sesiones. La estructura queda.
+
+En la carpeta `llegue-api`, con el archivo `.env` que tenga `DATABASE_URL` de Neon (no lo pegues en el chat):
+
+```bat
+npm run reset-db -- BORRAR
+```
+
+Tiene que decir `Base: postgres` y al final `users ahora: 0`.
+
+Después abrí `https://llegue-api.onrender.com/health` y fijate `"users": 0`.
+Si el servidor estaba dormido, esperá a que despierte y actualizá la página.
+
+Sin la palabra `BORRAR` el comando no borra nada.
+
