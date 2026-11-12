@@ -2,6 +2,7 @@
  * Verifica cancelación de salida especial, creador persistido
  * y payload kid_stopped_sharing. Levanta la API en un puerto libre.
  */
+import './isolate-db.mjs';
 import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
@@ -58,7 +59,7 @@ async function login(base, phone, installId) {
   const reqOtp = await api(base, 'POST', '/auth/request-otp', { body: { phone } });
   assert(reqOtp.status === 200, `OTP ${phone}: ${JSON.stringify(reqOtp.json)}`);
   const verify = await api(base, 'POST', '/auth/verify-otp', {
-    body: { phone, code: '123456', installId, platform: 'android' },
+    body: { phone, code: '654321', installId, platform: 'android' },
   });
   assert(verify.status === 200, `login ${phone}: ${JSON.stringify(verify.json)}`);
   return verify.json;
@@ -72,13 +73,13 @@ async function run() {
     data: {
       type: 'kid_stopped_sharing',
       kidId: 'seed-kid-mateo',
-      phone: '5493743489328',
+      phone: '5491100000002',
       eventType: 'location_lost',
     },
   });
   assert(fcm.type === 'kid_stopped_sharing', 'FCM type');
   assert(fcm.kidId === 'seed-kid-mateo', 'FCM kidId');
-  assert(fcm.phone === '5493743489328', 'FCM phone');
+  assert(fcm.phone === '5491100000002', 'FCM phone');
   assert(fcm.eventType === 'location_lost', 'FCM eventType');
   assert(fcm.urgent === 'true', 'FCM urgent string');
 
@@ -92,8 +93,10 @@ async function run() {
       ...process.env,
       PORT: String(port),
       LLEGUE_DB_PATH: dbPath,
+      LLEGUE_TEST: '1',
+      NODE_ENV: 'development',
       SEED_FAMILIA: 'true',
-      OTP_DEV_CODE: '123456',
+      OTP_DEV_CODE: '654321',
       JWT_SECRET: 'test-cancel-secret',
       JWT_REFRESH_SECRET: 'test-cancel-refresh',
     },
@@ -105,8 +108,8 @@ async function run() {
   });
   try {
     await waitHealth(base);
-    const adult = await login(base, '5493743483429', 'test-install-adult-cancel01');
-    const kid = await login(base, '5493743489328', 'test-install-kid-cancel01');
+    const adult = await login(base, '5491100000001', 'test-install-adult-cancel01');
+    const kid = await login(base, '5491100000002', 'test-install-kid-cancel01');
     const adultTok = adult.accessToken;
     const kidTok = kid.accessToken;
 
@@ -131,6 +134,8 @@ async function run() {
     const trip = created.json.trip;
     assert(trip.status === 'active', 'trip active al crear');
     assert(trip.phase === 'pending_departure', 'fase inicial');
+    assert(trip.departedAt == null, 'adulto: todavía no salió de casa');
+    assert(created.json.event == null, 'el adulto no avisa al armar la salida');
     assert(trip.createdByUserId === 'seed-adult-enzo', 'createdByUserId adulto');
     assert(String(trip.createdByName).includes('Enzo'), `createdByName: ${trip.createdByName}`);
 
@@ -211,6 +216,9 @@ async function run() {
     assert(kidTrip.status === 201, `trip del hijo: ${JSON.stringify(kidTrip.json)}`);
     assert(kidTrip.json.trip.createdByUserId === 'seed-kid-mateo', 'creador hijo id');
     assert(kidTrip.json.trip.createdByName === 'Mateo', 'creador hijo nombre');
+    assert(kidTrip.json.trip.phase === 'pending_departure', 'colegio del hijo sigue pending');
+    assert(kidTrip.json.trip.departedAt == null, 'colegio del hijo todavía no salió');
+    assert(kidTrip.json.event?.type === 'going_to', 'aviso de salida, no de llegada');
     await api(base, 'PATCH', `/trips/${kidTrip.json.trip.id}`, {
       token: kidTok,
       body: { action: 'cancel' },
@@ -362,7 +370,7 @@ async function run() {
     assert(closedEvent?.type === 'app_closed', 'evento app_closed');
     assert(closedEvent?.payload?.type === 'kid_stopped_sharing', 'payload type');
     assert(closedEvent?.payload?.kidId === 'seed-kid-mateo', 'payload kidId');
-    assert(closedEvent?.payload?.phone === '5493743489328', 'payload phone');
+    assert(closedEvent?.payload?.phone === '5491100000002', 'payload phone');
 
     console.log('ok: cancel, creador, kid_stopped_sharing, ciclo Casa→destino→Casa, GPS Super');
   } finally {

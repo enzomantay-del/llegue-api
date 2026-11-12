@@ -2,6 +2,7 @@
  * location_lost solo si el menor YA compartía y después corta.
  * POST /places: 401 si no hay sesión (no “sin familia”).
  */
+import './isolate-db.mjs';
 import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
@@ -56,7 +57,7 @@ async function api(base, method, pathname, { token, body } = {}) {
 async function login(base, phone, installId) {
   await api(base, 'POST', '/auth/request-otp', { body: { phone } });
   const verify = await api(base, 'POST', '/auth/verify-otp', {
-    body: { phone, code: '123456', installId, platform: 'android' },
+    body: { phone, code: '654321', installId, platform: 'android' },
   });
   assert(verify.status === 200, `login ${phone}: ${JSON.stringify(verify.json)}`);
   return verify.json;
@@ -73,8 +74,10 @@ async function run() {
       ...process.env,
       PORT: String(port),
       LLEGUE_DB_PATH: dbPath,
+      LLEGUE_TEST: '1',
+      NODE_ENV: 'development',
       SEED_FAMILIA: 'true',
-      OTP_DEV_CODE: '123456',
+      OTP_DEV_CODE: '654321',
       JWT_SECRET: 'test-share-secret',
       JWT_REFRESH_SECRET: 'test-share-refresh',
     },
@@ -82,8 +85,8 @@ async function run() {
   });
   try {
     await waitHealth(base);
-    const adult = await login(base, '5493743483429', 'test-install-adult-share01');
-    const kid = await login(base, '5493743489328', 'test-install-kid-share01');
+    const adult = await login(base, '5491100000001', 'test-install-adult-share01');
+    const kid = await login(base, '5491100000002', 'test-install-kid-share01');
 
     const noAuth = await api(base, 'POST', '/places', {
       body: { name: 'Plaza', lat: -27.04, lng: -55.22, type: 'favorite' },

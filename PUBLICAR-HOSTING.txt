@@ -7,7 +7,7 @@ https://github.com/enzomantay-del/llegue-api
 2) Conectá GitHub → repo llegue-api
 3) Runtime: Docker · Plan: Free · Branch: main
 4) Variables:
-   OTP_DEV_CODE=123456
+   OTP_DEV_CODE=(definilo en el dashboard de Render, no en el repo)
    OTP_EXPOSE_DEV_CODE=false
    SEED_FAMILIA=false
    INVITE_PUBLIC_BASE_URL=https://TU-SERVICIO.onrender.com

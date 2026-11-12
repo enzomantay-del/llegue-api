@@ -1,5 +1,5 @@
 {
-  "_lee_esto": "Editá UNA sola vez los teléfonos reales (solo números, con código de país). Guardá, corré INICIAR-PRUEBA-FACIL.bat y listo. OTP de prueba: siempre 123456. PIN de Mateo: 1234.",
+  "_lee_esto": "Números de ejemplo para desarrollo local (no son teléfonos reales). Si hace falta, editalos una sola vez: solo dígitos, con código de país. PIN de Mateo: 1234.",
   "family": {
     "id": "seed-family-mantay",
     "name": "Familia Mantay"
@@ -7,13 +7,13 @@
   "adult": {
     "id": "seed-adult-enzo",
     "name": "Enzo Gabriel Mantay",
-    "phone": "5493743483429",
+    "phone": "5491100000001",
     "relationshipLabel": "Padre"
   },
   "kid": {
     "id": "seed-kid-mateo",
     "name": "Mateo",
-    "phone": "5493743489328",
+    "phone": "5491100000002",
     "pin": "1234"
   },
   "places": [

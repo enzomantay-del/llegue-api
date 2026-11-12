@@ -183,6 +183,5 @@ if (process.argv[1] && path.normalize(process.argv[1]).endsWith('seed-familia.mj
   console.log(`  Adulto: ${info.adultName} · tel ${info.adultPhone}`);
   console.log(`  Hijo/a: ${info.kidName} · tel ${info.kidPhone} · PIN ${info.kidPin}`);
   console.log(`  Lugares: ${info.places.join(', ')}`);
-  console.log('OTP de prueba: 123456');
   await db.close?.();
 }

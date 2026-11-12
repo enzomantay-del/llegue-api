@@ -29,6 +29,7 @@ Copiá `.env.example` a `.env` en local.
 | `REFRESH_TTL_SEC` | no | Default 60 días. |
 | `PORT` | no | Render lo inyecta. Local: 8787. |
 | `SEED_FAMILIA` | no | En prod dejar `false`. |
+| `OTP_DEV_CODE` | sí, para entrar | Solo en el entorno (local o Render). No tiene valor por defecto en el repo. |
 
 ## Cómo probar
 

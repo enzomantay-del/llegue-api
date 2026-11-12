@@ -19,8 +19,10 @@ services:
         sync: false
       - key: JWT_REFRESH_SECRET
         sync: false
+      # Privado. Definilo en Dashboard → Environment del servicio llegue-api
+      # (no llegue-api-1) ANTES de desplegar. No pongas el valor en este archivo.
       - key: OTP_DEV_CODE
-        value: "123456"
+        sync: false
       - key: OTP_EXPOSE_DEV_CODE
         value: "false"
       - key: SEED_FAMILIA

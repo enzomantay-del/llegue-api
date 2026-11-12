@@ -6,7 +6,11 @@ import { isLocalDbUrl, isPostgresUrl, toPgParams } from './sql.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const envPath = path.join(__dirname, '..', '.env');
-if (process.env.RESET_IGNORE_DOTENV !== '1' && fs.existsSync(envPath)) {
+if (
+  process.env.RESET_IGNORE_DOTENV !== '1' &&
+  process.env.LLEGUE_TEST !== '1' &&
+  fs.existsSync(envPath)
+) {
   for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
     const m = line.match(/^([^#=]+)=(.*)$/);
     if (!m) continue;
@@ -125,7 +129,10 @@ async function openPostgres(databaseUrl) {
  * SQLite solo en desarrollo (el disco de Render Free se borra al sleep/redeploy).
  */
 export async function openDatabase() {
-  const url = String(process.env.DATABASE_URL ?? '').trim();
+  // LLEGUE_TEST=1: la suite no abre Neon aunque DATABASE_URL venga del
+  // entorno o de un .env. En producción, sin Postgres, SQLite sigue prohibido.
+  const url =
+    process.env.LLEGUE_TEST === '1' ? '' : String(process.env.DATABASE_URL ?? '').trim();
   if (url) {
     if (!isPostgresUrl(url)) {
       throw new Error(

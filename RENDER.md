@@ -18,7 +18,7 @@ Opcionales útiles:
 
 | Variable | Valor típico |
 | --- | --- |
-| `OTP_DEV_CODE` | `123456` (solo pruebas) |
+| `OTP_DEV_CODE` | Código privado, solo en Environment del servicio **llegue-api** (no `llegue-api-1`). No lo subas al repo. Definilo **antes** de desplegar; si ya estaba en `render.yaml`, rotalo y confirmá que sigue como variable de entorno. |
 | `SEED_FAMILIA` | `false` |
 | `APK_DOWNLOAD_URL` | `https://github.com/enzomantay-del/llegue-mobile/releases/latest/download/Llegue.apk` |
 
