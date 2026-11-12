@@ -1751,14 +1751,7 @@ ${tip}
 </main></body></html>`;
 }
 
-function trialLandingHtml({ downloadUrl, otpCode }) {
-  const code = String(otpCode ?? '').trim();
-  const codeStep = code
-    ? '<li>Ingresá tu teléfono y el código de prueba de abajo.</li>'
-    : '<li>Ingresá tu teléfono y el código que te pasó quien administra Llegué.</li>';
-  const codeBox = code
-    ? `<div class="box">Código de prueba:<br/><strong>${code}</strong></div>`
-    : '';
+function trialLandingHtml({ downloadUrl }) {
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Probar Llegué</title>
 <style>
 body{font-family:Segoe UI,system-ui,sans-serif;margin:0;min-height:100vh;background:linear-gradient(155deg,#0f3d34,#1f8a70 55%,#3d2a1a);color:#fff;display:grid;place-items:center;padding:24px}
@@ -1768,8 +1761,6 @@ h1{font-family:Georgia,serif;margin:0 0 8px;font-size:2rem}
 p{margin:0 0 12px;line-height:1.45;color:rgba(255,255,255,.88)}
 ol{margin:0 0 18px;padding-left:1.2rem;color:rgba(255,255,255,.9);line-height:1.55}
 li{margin-bottom:8px}
-.box{background:rgba(255,255,255,.14);border-radius:14px;padding:14px 16px;margin:16px 0}
-.box strong{font-size:1.35rem;letter-spacing:.08em}
 .btn{display:block;text-align:center;text-decoration:none;color:#0f3d34;background:#fff;font-weight:800;padding:18px;border-radius:16px;margin-top:8px}
 .note{margin-top:16px;font-size:.9rem;color:rgba(255,255,255,.7)}
 </style></head>
@@ -1782,11 +1773,10 @@ li{margin-bottom:8px}
   <li>Tocá <strong>Descargar Llegué</strong> e instalá (si Android pide permiso para apps desconocidas, aceptalo).</li>
   <li>Abrí la app, leé y aceptá las bases.</li>
   <li>Tocá <strong>Comenzar</strong> (familia nueva) o <strong>Ya tengo cuenta</strong>.</li>
-  ${codeStep}
+  <li>Ingresá tu teléfono y el código que te pasaron.</li>
 </ol>
-${codeBox}
 <a class="btn" href="${downloadUrl}">Descargar Llegué</a>
-<p class="note">Es una versión de prueba. El código es fijo mientras dure esta etapa (aún no enviamos SMS).</p>
+<p class="note">Es una versión de prueba. Todavía no enviamos SMS: usá el código que te dieron.</p>
 </main></body></html>`;
 }
 
@@ -1881,7 +1871,6 @@ const server = http.createServer(async (req, res) => {
       const base = publicInviteBase(process.env.INVITE_PUBLIC_BASE_URL, host);
       return send(res, 200, trialLandingHtml({
         downloadUrl: `${base}/download/llegue.apk`,
-        otpCode: OTP_DEV_CODE,
       }));
     }
 

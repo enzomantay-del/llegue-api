@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const files = [
   'test/sql-pg-params.mjs',
+  'test/trial-page-hides-otp.mjs',
   'test/special-trip-cancel.mjs',
   'test/invite-auth-refresh.mjs',
   'test/share-place-auth.mjs',
