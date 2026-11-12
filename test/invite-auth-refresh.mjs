@@ -4,6 +4,7 @@
  * Sesión vencida → 401 (no el 403 confuso).
  * POST /auth/refresh renueva tokens.
  */
+import './isolate-db.mjs';
 import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import crypto from 'node:crypto';
@@ -62,7 +63,7 @@ async function login(base, phone, installId) {
   const reqOtp = await api(base, 'POST', '/auth/request-otp', { body: { phone } });
   assert(reqOtp.status === 200, `OTP ${phone}: ${JSON.stringify(reqOtp.json)}`);
   const verify = await api(base, 'POST', '/auth/verify-otp', {
-    body: { phone, code: '123456', installId, platform: 'android' },
+    body: { phone, code: '654321', installId, platform: 'android' },
   });
   assert(verify.status === 200, `login ${phone}: ${JSON.stringify(verify.json)}`);
   return verify.json;
@@ -101,8 +102,10 @@ async function run() {
       ...process.env,
       PORT: String(port),
       LLEGUE_DB_PATH: dbPath,
+      LLEGUE_TEST: '1',
+      NODE_ENV: 'development',
       SEED_FAMILIA: 'true',
-      OTP_DEV_CODE: '123456',
+      OTP_DEV_CODE: '654321',
       JWT_SECRET,
       JWT_REFRESH_SECRET: JWT_REFRESH,
     },
@@ -115,8 +118,8 @@ async function run() {
   try {
     await waitHealth(base);
 
-    const adult = await login(base, '5493743483429', 'test-install-adult-invite01');
-    const kid = await login(base, '5493743489328', 'test-install-kid-invite01');
+    const adult = await login(base, '5491100000001', 'test-install-adult-invite01');
+    const kid = await login(base, '5491100000002', 'test-install-kid-invite01');
     assert(adult.user?.role === 'admin_adult' || adult.user?.role === 'adult', 'adulto seed');
     assert(kid.user?.role === 'kid', 'menor seed');
 

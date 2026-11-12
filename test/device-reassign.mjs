@@ -2,6 +2,7 @@
  * Un celular se puede reasignar si la persona lo confirma.
  * Un número sigue siendo de una sola persona.
  */
+import './isolate-db.mjs';
 import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
@@ -53,11 +54,24 @@ async function api(base, method, pathname, { token, body } = {}) {
   return { status: res.status, json };
 }
 
+function assertOwnLookup(json, name) {
+  assert(json.bound === true, `bound ${name}: ${JSON.stringify(json)}`);
+  assert(json.user?.name === name, `nombre ${name}: ${JSON.stringify(json)}`);
+  const keys = Object.keys(json.user || {}).sort();
+  assert(
+    JSON.stringify(keys) === JSON.stringify(['id', 'name', 'role']),
+    `forma de user ${name}: ${keys.join(',')}`,
+  );
+  assert(!('phone' in (json.user || {})), `lookup no devuelve teléfono (${name})`);
+  assert(json.family?.id && json.family?.name, `familia ${name}: ${JSON.stringify(json.family)}`);
+  assert(!JSON.stringify(json).includes('549'), `lookup sin número (${name})`);
+}
+
 async function login(base, phone, installId, extra = {}) {
   const reqOtp = await api(base, 'POST', '/auth/request-otp', { body: { phone } });
   assert(reqOtp.status === 200, `OTP ${phone}: ${JSON.stringify(reqOtp.json)}`);
   const verify = await api(base, 'POST', '/auth/verify-otp', {
-    body: { phone, code: '123456', installId, platform: 'android', ...extra },
+    body: { phone, code: '654321', installId, platform: 'android', ...extra },
   });
   return verify;
 }
@@ -75,8 +89,9 @@ async function run() {
       ...process.env,
       PORT: String(port),
       LLEGUE_DB_PATH: dbPath,
+      LLEGUE_TEST: '1',
       SEED_FAMILIA: 'false',
-      OTP_DEV_CODE: '123456',
+      OTP_DEV_CODE: '654321',
       JWT_SECRET: 'reassign-test-secret',
       JWT_REFRESH_SECRET: 'reassign-test-refresh',
       NODE_ENV: 'development',
@@ -125,20 +140,53 @@ async function run() {
     assert(accepted.json.user?.name === 'Mateo', 'nombre Mateo');
     assert(accepted.json.user?.role === 'kid', 'rol menor');
 
-    const lookA = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`);
-    const lookB = await api(base, 'GET', `/devices/lookup?installId=${phoneB}`);
-    assert(lookA.json.user?.name === 'Soraya', `A es Soraya: ${JSON.stringify(lookA.json)}`);
-    assert(lookB.json.user?.name === 'Mateo', `B es Mateo: ${JSON.stringify(lookB.json)}`);
+    const sorayaTok = family.json.accessToken || soraya.json.accessToken;
+    const mateoTok = accepted.json.accessToken || mateoOtp.json.accessToken;
+
+    const anonLook = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`);
+    assert(anonLook.status === 401, `lookup sin sesión: ${anonLook.status} ${JSON.stringify(anonLook.json)}`);
+    const badLook = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`, {
+      token: 'token-falso',
+    });
+    assert(badLook.status === 401, `lookup token inválido: ${badLook.status}`);
+    const anonRelease = await api(base, 'POST', '/devices/release', {
+      body: { installId: phoneA, confirm: true },
+    });
+    assert(anonRelease.status === 401, `release sin sesión: ${anonRelease.status} ${JSON.stringify(anonRelease.json)}`);
+
+    const lookA = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`, { token: sorayaTok });
+    const lookB = await api(base, 'GET', `/devices/lookup?installId=${phoneB}`, { token: mateoTok });
+    assert(lookA.status === 200, `lookup A: ${lookA.status}`);
+    assert(lookB.status === 200, `lookup B: ${lookB.status}`);
+    assertOwnLookup(lookA.json, 'Soraya');
+    assertOwnLookup(lookB.json, 'Mateo');
+    assert(lookB.json.user?.role === 'kid', 'B es menor');
+
+    const crossLook = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`, { token: mateoTok });
+    assert(crossLook.status === 403, `lookup ajeno: ${crossLook.status} ${JSON.stringify(crossLook.json)}`);
+    assert(!JSON.stringify(crossLook.json).includes('Soraya'), 'no filtra el nombre ajeno');
+    assert(!JSON.stringify(crossLook.json).includes('549'), 'no filtra el teléfono ajeno');
+    const crossRelease = await api(base, 'POST', '/devices/release', {
+      token: mateoTok,
+      body: { installId: phoneA, confirm: true },
+    });
+    assert(crossRelease.status === 403, `release ajeno: ${crossRelease.status}`);
+
+    const unbound = await api(base, 'GET', '/devices/lookup?installId=install-libre-xyz', {
+      token: sorayaTok,
+    });
+    assert(unbound.status === 200 && unbound.json.bound === false, `libre: ${JSON.stringify(unbound.json)}`);
+    assert(unbound.json.user == null, 'libre sin user');
 
     const blocked = await login(base, '5492222222222', phoneA);
     assert(blocked.status === 409, `sin confirmar: ${JSON.stringify(blocked.json)}`);
     assert(blocked.json.code === 'device_bound', 'code device_bound');
     assert(blocked.json.boundUser?.name === 'Soraya', 'sigue Soraya');
-    const stillA = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`);
-    assert(stillA.json.user?.name === 'Soraya', 'no reasignó sin confirmar');
+    const stillA = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`, { token: sorayaTok });
+    assertOwnLookup(stillA.json, 'Soraya');
 
     const nico = await api(base, 'POST', '/invitations', {
-      token: family.json.accessToken || soraya.json.accessToken,
+      token: sorayaTok,
       body: { name: 'Nico', role: 'kid' },
     });
     assert(nico.status === 201, `invite Nico: ${JSON.stringify(nico.json)}`);
@@ -152,10 +200,13 @@ async function run() {
         String(wrongNumber.json.error).includes('Nico'),
       `mensaje número: ${wrongNumber.json.error}`,
     );
-    const stillSoraya = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`);
-    assert(stillSoraya.json.user?.name === 'Soraya', 'el número del adulto no pasó el celular a Nico');
+    const stillSoraya = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`, {
+      token: sorayaTok,
+    });
+    assertOwnLookup(stillSoraya.json, 'Soraya');
 
     const noConfirm = await api(base, 'POST', '/devices/release', {
+      token: sorayaTok,
       body: { installId: phoneA, confirm: false },
     });
     assert(noConfirm.status === 400, `release sin confirm: ${JSON.stringify(noConfirm.json)}`);
@@ -163,23 +214,28 @@ async function run() {
     const swapped = await login(base, '5492222222222', phoneA, { reassignDevice: true });
     assert(swapped.status === 200, `reasignar A a Mateo: ${JSON.stringify(swapped.json)}`);
     assert(swapped.json.user?.name === 'Mateo', 'A ahora Mateo');
-    const afterA = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`);
-    const afterB = await api(base, 'GET', `/devices/lookup?installId=${phoneB}`);
-    assert(afterA.json.bound === true && afterA.json.user?.name === 'Mateo', 'lookup A Mateo');
+    const mateoOnA = swapped.json.accessToken;
+    const afterA = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`, { token: mateoOnA });
+    const afterB = await api(base, 'GET', `/devices/lookup?installId=${phoneB}`, { token: mateoOnA });
+    assert(afterA.status === 200 && afterA.json.bound === true && afterA.json.user?.name === 'Mateo', 'lookup A Mateo');
+    assert(!('phone' in (afterA.json.user || {})), 'A reasignado sin teléfono');
     assert(afterB.json.bound === false, `B quedó libre: ${JSON.stringify(afterB.json)}`);
 
     const sorayaOnB = await login(base, '5491111111111', phoneB);
     assert(sorayaOnB.status === 200, `Soraya en B: ${JSON.stringify(sorayaOnB.json)}`);
-    const finalB = await api(base, 'GET', `/devices/lookup?installId=${phoneB}`);
-    assert(finalB.json.user?.name === 'Soraya', 'B es Soraya');
+    const sorayaOnBTok = sorayaOnB.json.accessToken;
+    const finalB = await api(base, 'GET', `/devices/lookup?installId=${phoneB}`, { token: sorayaOnBTok });
+    assertOwnLookup(finalB.json, 'Soraya');
     assert(finalB.json.user?.role === 'admin_adult' || finalB.json.user?.role === 'adult', 'B adulto');
 
     const released = await api(base, 'POST', '/devices/release', {
+      token: mateoOnA,
       body: { installId: phoneA, confirm: true },
     });
     assert(released.status === 200 && released.json.released === true, 'release A');
     assert(released.json.previousUser?.name === 'Mateo', 'salió Mateo');
-    const freeA = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`);
+    assert(!('phone' in (released.json.previousUser || {})), 'release sin teléfono');
+    const freeA = await api(base, 'GET', `/devices/lookup?installId=${phoneA}`, { token: mateoOnA });
     assert(freeA.json.bound === false, 'A ya no saluda a la persona vieja');
 
     console.log('ok: invertir roles con confirmación; un número sigue siendo una persona');

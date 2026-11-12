@@ -2,6 +2,7 @@
  * Reset pide confirmación, el doble aviso de geocerca no se duplica,
  * y después del reset /health dice users: 0.
  */
+import './isolate-db.mjs';
 import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
@@ -77,7 +78,7 @@ async function login(base, phone, installId, extra = {}) {
   const otp = await api(base, 'POST', '/auth/request-otp', { body: { phone } });
   assert(otp.status === 200, `otp ${JSON.stringify(otp.json)}`);
   return api(base, 'POST', '/auth/verify-otp', {
-    body: { phone, code: '123456', installId, platform: 'android', ...extra },
+    body: { phone, code: '654321', installId, platform: 'android', ...extra },
   });
 }
 
@@ -86,12 +87,13 @@ function startServer(dbPath, port) {
     cwd: root,
     env: {
       ...process.env,
+      LLEGUE_TEST: '1',
       RESET_IGNORE_DOTENV: '1',
       DATABASE_URL: '',
       PORT: String(port),
       LLEGUE_DB_PATH: dbPath,
       SEED_FAMILIA: 'false',
-      OTP_DEV_CODE: '123456',
+      OTP_DEV_CODE: '654321',
       JWT_SECRET: 'reset-test-secret',
       JWT_REFRESH_SECRET: 'reset-test-refresh',
       NODE_ENV: 'development',
@@ -110,6 +112,7 @@ async function run() {
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'llegue-reset-'));
   const dbPath = path.join(tmp, 'llegue.db');
   const baseEnv = {
+    LLEGUE_TEST: '1',
     RESET_IGNORE_DOTENV: '1',
     DATABASE_URL: '',
     LLEGUE_DB_PATH: dbPath,

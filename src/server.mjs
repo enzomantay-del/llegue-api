@@ -19,7 +19,11 @@ const APK_DOWNLOAD_URL = (
 
 // Cargar .env simple
 const envPath = path.join(root, '.env');
-if (fs.existsSync(envPath)) {
+if (
+  process.env.LLEGUE_TEST !== '1' &&
+  process.env.RESET_IGNORE_DOTENV !== '1' &&
+  fs.existsSync(envPath)
+) {
   for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
     const m = line.match(/^([^#=]+)=(.*)$/);
     if (!m) continue;
@@ -40,7 +44,7 @@ const JWT_REFRESH = process.env.JWT_REFRESH_SECRET ?? 'llegue-dev-refresh';
 /** Access corto; el refresh (60 días) mantiene la sesión tras días sin abrir la app. */
 const ACCESS_TTL_SEC = Number(process.env.ACCESS_TTL_SEC ?? 7 * 24 * 60 * 60);
 const REFRESH_TTL_SEC = Number(process.env.REFRESH_TTL_SEC ?? 60 * 24 * 60 * 60);
-const OTP_DEV_CODE = process.env.OTP_DEV_CODE ?? '123456';
+const OTP_DEV_CODE = String(process.env.OTP_DEV_CODE ?? '').trim();
 const OTP_EXPOSE = (process.env.OTP_EXPOSE_DEV_CODE ?? 'false') === 'true';
 /** Zona horaria de la familia (Argentina). Render corre en UTC; sin esto los avisos salen +3h. */
 const APP_TZ = process.env.APP_TZ || 'America/Argentina/Buenos_Aires';
@@ -1747,7 +1751,7 @@ ${tip}
 </main></body></html>`;
 }
 
-function trialLandingHtml({ downloadUrl, otpCode }) {
+function trialLandingHtml({ downloadUrl }) {
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Probar Llegué</title>
 <style>
 body{font-family:Segoe UI,system-ui,sans-serif;margin:0;min-height:100vh;background:linear-gradient(155deg,#0f3d34,#1f8a70 55%,#3d2a1a);color:#fff;display:grid;place-items:center;padding:24px}
@@ -1757,8 +1761,6 @@ h1{font-family:Georgia,serif;margin:0 0 8px;font-size:2rem}
 p{margin:0 0 12px;line-height:1.45;color:rgba(255,255,255,.88)}
 ol{margin:0 0 18px;padding-left:1.2rem;color:rgba(255,255,255,.9);line-height:1.55}
 li{margin-bottom:8px}
-.box{background:rgba(255,255,255,.14);border-radius:14px;padding:14px 16px;margin:16px 0}
-.box strong{font-size:1.35rem;letter-spacing:.08em}
 .btn{display:block;text-align:center;text-decoration:none;color:#0f3d34;background:#fff;font-weight:800;padding:18px;border-radius:16px;margin-top:8px}
 .note{margin-top:16px;font-size:.9rem;color:rgba(255,255,255,.7)}
 </style></head>
@@ -1771,11 +1773,10 @@ li{margin-bottom:8px}
   <li>Tocá <strong>Descargar Llegué</strong> e instalá (si Android pide permiso para apps desconocidas, aceptalo).</li>
   <li>Abrí la app, leé y aceptá las bases.</li>
   <li>Tocá <strong>Comenzar</strong> (familia nueva) o <strong>Ya tengo cuenta</strong>.</li>
-  <li>Ingresá tu teléfono y el código de prueba de abajo.</li>
+  <li>Ingresá tu teléfono y el código que te pasaron.</li>
 </ol>
-<div class="box">Código de prueba:<br/><strong>${otpCode}</strong></div>
 <a class="btn" href="${downloadUrl}">Descargar Llegué</a>
-<p class="note">Es una versión de prueba. El código es fijo mientras dure esta etapa (aún no enviamos SMS).</p>
+<p class="note">Es una versión de prueba. Todavía no enviamos SMS: usá el código que te dieron.</p>
 </main></body></html>`;
 }
 
@@ -1870,7 +1871,6 @@ const server = http.createServer(async (req, res) => {
       const base = publicInviteBase(process.env.INVITE_PUBLIC_BASE_URL, host);
       return send(res, 200, trialLandingHtml({
         downloadUrl: `${base}/download/llegue.apk`,
-        otpCode: process.env.OTP_DEV_CODE || '123456',
       }));
     }
 
@@ -1934,6 +1934,11 @@ const server = http.createServer(async (req, res) => {
 
     // AUTH
     if (req.method === 'POST' && pathname === '/auth/request-otp') {
+      if (!OTP_DEV_CODE) {
+        return send(res, 500, {
+          error: 'Falta configurar el código de verificación en el servidor.',
+        });
+      }
       const body = await readBody(req);
       const phone = normalizePhone(body.phone ?? '');
       if (phone.length < 8) return send(res, 400, { error: 'Escribí un teléfono válido.' });
@@ -1944,6 +1949,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/auth/request-email-otp') {
+      if (!OTP_DEV_CODE) {
+        return send(res, 500, {
+          error: 'Falta configurar el código de verificación en el servidor.',
+        });
+      }
       const body = await readBody(req);
       const email = normalizeEmail(body.email ?? '');
       if (!email.includes('@') || email.length < 6) {
@@ -2016,9 +2026,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && pathname === '/devices/lookup') {
+      const user = await authUser(req);
+      if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       const installId = url.searchParams.get('installId') ?? '';
       const bound = await findDeviceByInstall(installId);
       if (!bound) return send(res, 200, { bound: false });
+      if (bound.user_id !== user.id) {
+        return send(res, 403, { error: 'Este celular está asociado a otra persona.' });
+      }
       const family = bound.user_family_id
         ? await db.prepare('SELECT * FROM families WHERE id = ?').get(bound.user_family_id)
         : null;
@@ -2028,18 +2043,23 @@ const server = http.createServer(async (req, res) => {
           id: bound.user_id,
           name: bound.user_name,
           role: bound.user_role,
-          phone: bound.user_phone,
         },
         family: family ? { id: family.id, name: family.name } : null,
       });
     }
 
     if (req.method === 'POST' && pathname === '/devices/release') {
+      const user = await authUser(req);
+      if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       const body = await readBody(req);
       if (body.confirm !== true) {
         return send(res, 400, {
           error: 'Confirmá que este celular va a cambiar de persona.',
         });
+      }
+      const bound = await findDeviceByInstall(body.installId);
+      if (bound && bound.user_id !== user.id) {
+        return send(res, 403, { error: 'Este celular está asociado a otra persona.' });
       }
       const released = await releaseInstallBinding(body.installId);
       if (!released.ok) return send(res, released.status, { error: released.error });
@@ -3146,20 +3166,28 @@ const server = http.createServer(async (req, res) => {
       const id = uuid();
       const expected = body.expectedReturnAt ? String(body.expectedReturnAt) : null;
       const home = await familyHomePlace(user.family_id);
-      const phase = dest?.id ? 'pending_departure' : null;
+      const now = nowIso();
+      // Regreso a casa: el menor ya está afuera (plaza, escuela, etc.).
+      // Si nace en pending_departure, la llegada a Casa se descarta porque
+      // specialTripLeftHome sigue en falso (la salida de la plaza fue antes).
+      // Una salida Casa → otro lugar sigue en pending_departure hasta el EXIT.
+      const goingHome = wantsWalkingHome || dest?.type === 'home';
+      const phase = dest?.id ? (goingHome ? 'en_route' : 'pending_departure') : null;
+      const departedAt = goingHome && dest?.id ? now : null;
       await db.prepare(
         `INSERT INTO trips
          (id, kid_id, origin_place_id, destination_place_id, status, expected_return_at, started_at, created_at, phase, departed_at, created_by_user_id, created_by_name)
-         VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL, ?, ?)`,
+         VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         id,
         kid.id,
         home?.id ?? null,
         dest?.id ?? null,
         expected,
-        nowIso(),
-        nowIso(),
+        now,
+        now,
         phase,
+        departedAt,
         user.id,
         user.name,
       );

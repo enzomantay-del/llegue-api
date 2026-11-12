@@ -3,6 +3,7 @@
  * Simula el caso de campo: cerrar la app varios días / sleep de Render
  * no debe borrar familia si el archivo/Postgres sigue.
  */
+import './isolate-db.mjs';
 import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
@@ -64,10 +65,11 @@ function startServer({ port, dbPath, extraEnv = {} }) {
       ...process.env,
       PORT: String(port),
       LLEGUE_DB_PATH: dbPath,
+      LLEGUE_TEST: '1',
       DATABASE_URL: '',
       NODE_ENV: 'development',
       SEED_FAMILIA: 'true',
-      OTP_DEV_CODE: '123456',
+      OTP_DEV_CODE: '654321',
       JWT_SECRET: 'test-persist-secret',
       JWT_REFRESH_SECRET: 'test-persist-refresh',
       ...extraEnv,
@@ -78,7 +80,7 @@ function startServer({ port, dbPath, extraEnv = {} }) {
   child.stderr.on('data', (c) => {
     stderr += c.toString();
   });
-  return { child, getStderr: () => stderr };
+  return { child, port, getStderr: () => stderr };
 }
 
 async function stopServer(child) {
@@ -93,7 +95,7 @@ async function login(base, phone, installId) {
   const reqOtp = await api(base, 'POST', '/auth/request-otp', { body: { phone } });
   assert(reqOtp.status === 200, `OTP ${phone}: ${JSON.stringify(reqOtp.json)}`);
   const verify = await api(base, 'POST', '/auth/verify-otp', {
-    body: { phone, code: '123456', installId, platform: 'android' },
+    body: { phone, code: '654321', installId, platform: 'android' },
   });
   assert(verify.status === 200, `login ${phone}: ${JSON.stringify(verify.json)}`);
   return verify.json;
@@ -112,7 +114,7 @@ async function run() {
       assert(health.ok === true, 'health ok');
       assert(health.db?.dialect === 'sqlite', 'dialect sqlite en local');
 
-      const adult = await login(base1, '5493743483429', 'test-install-adult-persist01');
+      const adult = await login(base1, '5491100000001', 'test-install-adult-persist01');
       assert(adult.user?.familyId, `familyId al login: ${JSON.stringify(adult)}`);
       assert(adult.refreshToken, 'refresh token emitido');
       const me = await api(base1, 'GET', '/auth/me', { token: adult.accessToken });
@@ -145,7 +147,7 @@ async function run() {
     const second = startServer({ port: port2, dbPath });
     try {
       await waitHealth(base2);
-      const adult2 = await login(base2, '5493743483429', 'test-install-adult-persist01');
+      const adult2 = await login(base2, '5491100000001', 'test-install-adult-persist01');
       assert(adult2.user?.familyId, `familyId tras restart: ${JSON.stringify(adult2)}`);
       const me2 = await api(base2, 'GET', '/auth/me', { token: adult2.accessToken });
       assert(me2.json.family?.name === familyName, 'familia sigue tras restart');
@@ -160,10 +162,23 @@ async function run() {
       await stopServer(second.child);
     }
 
+    const fakeUrl = 'postgresql://user:pass@127.0.0.1:1/no-es-neon';
+    const isolated = startServer({
+      port: await getFreePort(),
+      dbPath,
+      extraEnv: { LLEGUE_TEST: '1', NODE_ENV: 'development', DATABASE_URL: fakeUrl },
+    });
+    try {
+      const isoHealth = await waitHealth(`http://127.0.0.1:${isolated.port}`);
+      assert(isoHealth.db?.dialect === 'sqlite', `test no usa DATABASE_URL: ${isoHealth.db?.dialect}`);
+    } finally {
+      await stopServer(isolated.child);
+    }
+
     const prod = startServer({
       port: await getFreePort(),
       dbPath,
-      extraEnv: { NODE_ENV: 'production', DATABASE_URL: '' },
+      extraEnv: { NODE_ENV: 'production', LLEGUE_TEST: '1', DATABASE_URL: fakeUrl },
     });
     const died = await new Promise((resolve) => {
       const t = setTimeout(() => resolve('timeout'), 4000);
