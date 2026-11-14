@@ -302,7 +302,7 @@ function send(res, status, data, headers = {}) {
   res.writeHead(status, {
     'content-type': typeof data === 'string' ? 'text/html; charset=utf-8' : 'application/json; charset=utf-8',
     'access-control-allow-origin': '*',
-    'access-control-allow-headers': 'authorization, content-type',
+    'access-control-allow-headers': 'authorization, content-type, idempotency-key',
     'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
     ...headers,
   });
@@ -523,7 +523,7 @@ async function isCancelledSpecialDestination(place, kidId) {
     .prepare(
       `SELECT id FROM trips
        WHERE kid_id = ? AND destination_place_id = ?
-         AND status = 'cancelled' AND routine_id IS NULL
+         AND status IN ('cancelled', 'expired') AND routine_id IS NULL
        LIMIT 1`,
     )
     .get(kidId, place.id);
@@ -614,9 +614,15 @@ async function resolveOrCreateTripDestination(user, body) {
     null;
   if (placeId) {
     const dest = await db
-      .prepare(`SELECT * FROM places WHERE id = ? AND family_id = ? AND status = 'active'`)
+      .prepare(`SELECT * FROM places WHERE id = ? AND family_id = ? AND status != 'deleted'`)
       .get(placeId, user.family_id);
-    if (dest) return dest;
+    if (dest?.status === 'inactive') {
+      await db
+        .prepare(`UPDATE places SET status = 'active' WHERE id = ? AND status = 'inactive'`)
+        .run(dest.id);
+      dest.status = 'active';
+    }
+    if (dest?.status === 'active') return dest;
   }
   const name = String(
     body.destinationName ?? nested.name ?? body.placeName ?? '',
@@ -752,12 +758,371 @@ async function tripPublic(t) {
   };
 }
 
-async function liveKidTrip(kidId) {
+/** Sin novedades durante este lapso, la salida deja de trabar a la familia. */
+function staleTripMs() {
+  const hours = Number(process.env.TRIP_STALE_HOURS ?? 12);
+  if (!Number.isFinite(hours) || hours <= 0) return 12 * 60 * 60 * 1000;
+  return hours * 60 * 60 * 1000;
+}
+
+function latestActivityMs(trip) {
+  let best = -Infinity;
+  for (const value of [trip?.started_at, trip?.created_at, trip?.departed_at, trip?.last_event_at]) {
+    const ms = Date.parse(value ?? '');
+    if (Number.isFinite(ms) && ms > best) best = ms;
+  }
+  return best;
+}
+
+function isUniqueViolation(err) {
+  if (String(err?.code ?? '') === '23505') return true;
+  return /unique constraint|duplicate key/i.test(String(err?.message || err));
+}
+
+async function expireTripRecord(trip) {
+  const result = await db
+    .prepare(
+      `UPDATE trips SET status = 'expired', ended_at = ?, phase = NULL
+       WHERE id = ? AND status IN ('active','overdue')`,
+    )
+    .run(nowIso(), trip.id);
+  if (!Number(result?.changes ?? 0)) return null;
+  if (isPlannedSpecialTrip(trip) && trip.destination_place_id) {
+    const dest = await db.prepare('SELECT * FROM places WHERE id = ?').get(trip.destination_place_id);
+    await retireTripOnlyDestination(dest, trip.id);
+  }
+  return await db.prepare('SELECT * FROM trips WHERE id = ?').get(trip.id);
+}
+
+/** Cierra salidas vivas que quedaron mudas (el celular dejó de avisar). */
+async function expireStaleTrips(kidId = null) {
+  const staleBefore = Date.now() - staleTripMs();
+  const rows = kidId
+    ? await db
+        .prepare(
+          `SELECT t.*,
+                  (SELECT MAX(e.created_at) FROM events e WHERE e.trip_id = t.id) AS last_event_at
+           FROM trips t
+           WHERE t.kid_id = ? AND t.status IN ('active','overdue')`,
+        )
+        .all(kidId)
+    : await db
+        .prepare(
+          `SELECT t.*,
+                  (SELECT MAX(e.created_at) FROM events e WHERE e.trip_id = t.id) AS last_event_at
+           FROM trips t
+           WHERE t.status IN ('active','overdue')`,
+        )
+        .all();
+  for (const trip of rows) {
+    const ms = latestActivityMs(trip);
+    if (!Number.isFinite(ms) || ms > staleBefore) continue;
+    await expireTripRecord(trip);
+  }
+}
+
+async function liveTripsForKid(kidId) {
+  await expireStaleTrips(kidId);
   return await db
     .prepare(
-      `SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC LIMIT 1`,
+      `SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC`,
     )
-    .get(kidId);
+    .all(kidId);
+}
+
+async function liveKidTrip(kidId) {
+  const rows = await liveTripsForKid(kidId);
+  return rows[0] ?? null;
+}
+
+const kidTripChains = new Map();
+
+function withKidLock(kidId, fn) {
+  const prev = kidTripChains.get(kidId) || Promise.resolve();
+  const run = prev.catch(() => {}).then(fn);
+  const tail = run.then(
+    () => {},
+    () => {},
+  );
+  kidTripChains.set(kidId, tail);
+  tail.finally(() => {
+    if (kidTripChains.get(kidId) === tail) kidTripChains.delete(kidId);
+  });
+  return run;
+}
+
+function parseIdempotencyKey(req) {
+  const raw = req.headers['idempotency-key'];
+  if (raw == null) return { key: null };
+  const key = String(raw).trim();
+  if (!key) return { key: null };
+  if (key.length > 200) return { error: 'La clave de reintento es demasiado larga.' };
+  return { key };
+}
+
+function wantsReplaceOpen(body) {
+  return body?.replaceOpen === true || body?.replaceOpen === 1 || body?.replaceOpen === 'true';
+}
+
+function tripBodyHasDestination(body) {
+  const nested = body?.destination && typeof body.destination === 'object' ? body.destination : {};
+  const placeId =
+    body?.destinationPlaceId || nested.id || nested.placeId || body?.destination_place_id || null;
+  if (placeId) return true;
+  if (String(body?.kind ?? '') === 'walking_home') return true;
+  const name = String(body?.destinationName ?? nested.name ?? body?.placeName ?? '').trim();
+  const lat = Number(body?.destinationLat ?? nested.lat ?? body?.lat);
+  const lng = Number(body?.destinationLng ?? nested.lng ?? body?.lng);
+  return name.length >= 2 && Number.isFinite(lat) && Number.isFinite(lng);
+}
+
+function tripCreateHash(body, kidId) {
+  const nested = body?.destination && typeof body.destination === 'object' ? body.destination : {};
+  const lat = Number(body?.destinationLat ?? nested.lat ?? body?.lat);
+  const lng = Number(body?.destinationLng ?? nested.lng ?? body?.lng);
+  const canonical = {
+    kidId: kidId ?? null,
+    destinationPlaceId:
+      body?.destinationPlaceId || nested.id || nested.placeId || body?.destination_place_id || null,
+    destinationName: String(body?.destinationName ?? nested.name ?? body?.placeName ?? '')
+      .trim()
+      .toLowerCase(),
+    destinationLat: Number.isFinite(lat) ? Math.round(lat * 1e6) / 1e6 : null,
+    destinationLng: Number.isFinite(lng) ? Math.round(lng * 1e6) / 1e6 : null,
+    kind: String(body?.kind ?? ''),
+    expectedReturnAt: body?.expectedReturnAt ? String(body.expectedReturnAt) : null,
+    replaceOpen: wantsReplaceOpen(body),
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+}
+
+async function replayTripBody(trip, user) {
+  let event = null;
+  if (user.role === 'kid') {
+    const row = await db
+      .prepare(
+        `SELECT * FROM events
+         WHERE trip_id = ? AND type IN ('going_to','walking_home')
+         ORDER BY created_at ASC LIMIT 1`,
+      )
+      .get(trip.id);
+    if (row) event = eventPublic(row);
+  }
+  return {
+    trip: await tripPublic(trip),
+    event,
+    notifiedCount: 0,
+    idempotentReplay: true,
+  };
+}
+
+async function loadIdempotentTrip(user, key, hash) {
+  const row = await db
+    .prepare(`SELECT * FROM trip_idempotency WHERE user_id = ? AND idempotency_key = ?`)
+    .get(user.id, key);
+  if (!row) return { found: false };
+  if (row.request_hash !== hash) return { found: true, mismatch: true };
+  let trip = row.trip_id
+    ? await db.prepare('SELECT * FROM trips WHERE id = ?').get(row.trip_id)
+    : null;
+  if (!trip && row.trip_id) {
+    const age = Date.now() - Date.parse(row.created_at);
+    if (!Number.isFinite(age) || age < 15000) {
+      for (let i = 0; i < 20 && !trip; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        trip = await db.prepare('SELECT * FROM trips WHERE id = ?').get(row.trip_id);
+      }
+    }
+  }
+  if (!trip) {
+    await db
+      .prepare(`DELETE FROM trip_idempotency WHERE user_id = ? AND idempotency_key = ?`)
+      .run(user.id, key);
+    return { found: false };
+  }
+  return { found: true, trip };
+}
+
+async function claimIdempotency(userId, key, hash, tripId) {
+  try {
+    await db
+      .prepare(
+        `INSERT INTO trip_idempotency (user_id, idempotency_key, request_hash, trip_id, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(userId, key, hash, tripId, nowIso());
+    return { claimed: true };
+  } catch (err) {
+    if (!isUniqueViolation(err)) throw err;
+    return { claimed: false };
+  }
+}
+
+async function createKidTrip({ user, kid, body, idempotencyKey }) {
+  const hash = tripCreateHash(body, kid.id);
+  if (idempotencyKey) {
+    const prior = await loadIdempotentTrip(user, idempotencyKey, hash);
+    if (prior.mismatch) {
+      return {
+        status: 409,
+        body: {
+          error: 'Esa clave de reintento ya se usó para otra salida.',
+          code: 'idempotency_mismatch',
+        },
+      };
+    }
+    if (prior.trip) return { status: 200, body: await replayTripBody(prior.trip, user) };
+  }
+
+  if (!tripBodyHasDestination(body)) {
+    return { status: 400, body: { error: 'Elegí a dónde va la salida.' } };
+  }
+
+  const live = await liveTripsForKid(kid.id);
+  const replaceOpen = wantsReplaceOpen(body);
+  if (live.length && !replaceOpen) {
+    return {
+      status: 409,
+      body: {
+        error: 'Ya hay una salida en curso. Primero marcá que llegaste.',
+        code: 'trip_in_progress',
+        openTrip: await tripPublic(live[0]),
+      },
+    };
+  }
+  if (live.length && replaceOpen && !isAdultRole(user.role)) {
+    return {
+      status: 403,
+      body: {
+        error: 'Solo un adulto puede reemplazar la salida en curso.',
+        code: 'replace_forbidden',
+        openTrip: await tripPublic(live[0]),
+      },
+    };
+  }
+
+  let dest = await resolveOrCreateTripDestination(user, body);
+  if (body.destinationPlaceId && !dest) {
+    return { status: 404, body: { error: 'Ese lugar no está disponible.' } };
+  }
+  const kind = String(body.kind ?? '');
+  const wantsWalkingHome = kind === 'walking_home';
+  if (!dest && wantsWalkingHome) {
+    dest = await familyHomePlace(user.family_id);
+    if (!dest) {
+      return {
+        status: 400,
+        body: { error: 'Todavía no hay un lugar Casa. Pedile a un adulto que lo agregue.' },
+      };
+    }
+  }
+  if (!dest) return { status: 400, body: { error: 'Elegí a dónde va la salida.' } };
+
+  const id = uuid();
+  if (idempotencyKey) {
+    const claim = await claimIdempotency(user.id, idempotencyKey, hash, id);
+    if (!claim.claimed) {
+      const prior = await loadIdempotentTrip(user, idempotencyKey, hash);
+      if (prior.mismatch) {
+        return {
+          status: 409,
+          body: {
+            error: 'Esa clave de reintento ya se usó para otra salida.',
+            code: 'idempotency_mismatch',
+          },
+        };
+      }
+      if (prior.trip) return { status: 200, body: await replayTripBody(prior.trip, user) };
+      return {
+        status: 409,
+        body: {
+          error: 'Estamos registrando esa salida. Probá de nuevo en un momento.',
+          code: 'idempotency_in_progress',
+        },
+      };
+    }
+  }
+
+  const expected = body.expectedReturnAt ? String(body.expectedReturnAt) : null;
+  const home = await familyHomePlace(user.family_id);
+  const now = nowIso();
+  const goingHome = wantsWalkingHome || dest?.type === 'home';
+  const phase = dest?.id ? (goingHome ? 'en_route' : 'pending_departure') : null;
+  const departedAt = goingHome && dest?.id ? now : null;
+  try {
+    await db
+      .prepare(
+        `INSERT INTO trips
+         (id, kid_id, origin_place_id, destination_place_id, status, expected_return_at, started_at, created_at, phase, departed_at, created_by_user_id, created_by_name)
+         VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        kid.id,
+        home?.id ?? null,
+        dest?.id ?? null,
+        expected,
+        now,
+        now,
+        phase,
+        departedAt,
+        user.id,
+        user.name,
+      );
+  } catch (err) {
+    if (idempotencyKey) {
+      await db
+        .prepare(
+          `DELETE FROM trip_idempotency WHERE user_id = ? AND idempotency_key = ? AND trip_id = ?`,
+        )
+        .run(user.id, idempotencyKey, id);
+    }
+    throw err;
+  }
+
+  if (replaceOpen) {
+    for (const old of live) await cancelTripRecord(old);
+  }
+
+  const trip = await db.prepare('SELECT * FROM trips WHERE id = ?').get(id);
+  const isWalkingHome = kind === 'walking_home' || dest?.type === 'home';
+  if (user.role === 'kid') {
+    const eventType = isWalkingHome ? 'walking_home' : 'going_to';
+    const created = await createEvent({
+      kid: user,
+      type: eventType,
+      placeId: dest?.id ?? null,
+      tripId: id,
+      forceNotify: true,
+      payload: {
+        source: 'trip_start',
+        kind: kind || eventType,
+        destinationPlaceId: dest?.id ?? null,
+        destinationName: dest?.name ?? null,
+        createdByUserId: user.id,
+      },
+    });
+    const fresh = await db.prepare('SELECT * FROM trips WHERE id = ?').get(id);
+    return {
+      status: 201,
+      body: {
+        trip: await tripPublic(fresh),
+        event: created.event,
+        notifiedCount: created.notifiedCount,
+      },
+    };
+  }
+
+  let notifiedCount = 0;
+  if (isAdultRole(user.role)) {
+    const destLabel = dest?.name ? ` a ${dest.name}` : '';
+    notifiedCount = await notifyKidUser(
+      kid.id,
+      'Salida especial',
+      isWalkingHome ? 'Te armaron un regreso a casa' : `Te armaron una salida especial${destLabel}`,
+    );
+  }
+  return { status: 201, body: { trip: await tripPublic(trip), event: null, notifiedCount } };
 }
 
 async function monitorGeofencesForKid(kid) {
@@ -1032,6 +1397,15 @@ async function bindInstallToUser(installId, user, platform = 'android', opts = {
     return { ok: false, status: 400, error: 'No pudimos identificar este celular. Reinstalá la app.' };
   }
 
+  // El id de fila cambia al migrar el install. El cursor de geocerca no: si se pierde,
+  // el próximo GPS parece “primer punto” y la salida/llegada no se registra.
+  const priorOwn = await db
+    .prepare(
+      `SELECT last_lat, last_lng, last_inside_place_id
+       FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1`,
+    )
+    .get(user.id);
+
   let byInstall = await findDeviceByInstall(idKey);
   if (byInstall && byInstall.user_id !== user.id) {
     if (!reassign) return deviceBoundPayload(byInstall);
@@ -1055,10 +1429,35 @@ async function bindInstallToUser(installId, user, platform = 'android', opts = {
   await db.prepare(
     `INSERT INTO devices
      (id, user_id, install_id, platform, push_token, location_permission, notifications_permission,
-      last_seen_at, location_ok, created_at)
-     VALUES (?, ?, ?, ?, NULL, 'not_asked', 'not_asked', ?, 1, ?)`,
-  ).run(deviceId, user.id, idKey, platform, nowIso(), nowIso());
+      last_seen_at, location_ok, last_lat, last_lng, last_inside_place_id, created_at)
+     VALUES (?, ?, ?, ?, NULL, 'not_asked', 'not_asked', ?, 1, ?, ?, ?, ?)`,
+  ).run(
+    deviceId,
+    user.id,
+    idKey,
+    platform,
+    nowIso(),
+    priorOwn?.last_lat ?? null,
+    priorOwn?.last_lng ?? null,
+    priorOwn?.last_inside_place_id ?? null,
+    nowIso(),
+  );
   return { ok: true, deviceId };
+}
+
+/** El id que la app tiene guardado puede ser el de antes de re-vincular el celular. */
+async function resolveOwnedDevice(userId, deviceId) {
+  if (deviceId) {
+    const exact = await db
+      .prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?')
+      .get(deviceId, userId);
+    if (exact) return exact;
+  }
+  return (
+    (await db
+      .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
+      .get(userId)) ?? null
+  );
 }
 
 function bindFailureBody(bind) {
@@ -1204,6 +1603,7 @@ async function createEvent({
   payload = null,
   forceNotify = null,
 }) {
+  if (kid?.id) await expireStaleTrips(kid.id);
   let notify = true;
   if (forceNotify != null) {
     notify = forceNotify;
@@ -1816,6 +2216,58 @@ function findApkPath() {
     if (fs.existsSync(p)) return p;
   }
   return null;
+}
+
+function parseSinceParam(value) {
+  if (value == null || String(value).trim() === '') return { since: null };
+  const ms = Date.parse(String(value));
+  if (!Number.isFinite(ms)) return { error: 'La fecha desde no es válida.' };
+  return { since: new Date(ms).toISOString() };
+}
+
+function notificationPublic(n) {
+  return {
+    id: n.id,
+    eventId: n.event_id,
+    eventType: n.event_type ?? null,
+    kidId: n.event_kid_id ?? null,
+    status: n.status,
+    title: n.title,
+    body: n.body,
+    sentAt: n.sent_at,
+    createdAt: n.created_at,
+  };
+}
+
+/**
+ * Avisos ya guardados. Sin `since`, los últimos 200 (el poll del adulto).
+ * Con `since`, esa ventana completa, aunque hayan pasado horas.
+ */
+async function listNotifications(userId, since) {
+  const rows = since
+    ? await db
+        .prepare(
+          `SELECT n.id, n.event_id, n.status, n.title, n.body, n.sent_at, n.created_at,
+                  e.type AS event_type, e.kid_id AS event_kid_id
+           FROM notifications n
+           LEFT JOIN events e ON e.id = n.event_id
+           WHERE n.recipient_user_id = ? AND n.created_at >= ?
+           ORDER BY n.created_at ASC
+           LIMIT ?`,
+        )
+        .all(userId, since, 500)
+    : await db
+        .prepare(
+          `SELECT n.id, n.event_id, n.status, n.title, n.body, n.sent_at, n.created_at,
+                  e.type AS event_type, e.kid_id AS event_kid_id
+           FROM notifications n
+           LEFT JOIN events e ON e.id = n.event_id
+           WHERE n.recipient_user_id = ?
+           ORDER BY n.created_at DESC
+           LIMIT ?`,
+        )
+        .all(userId, 200);
+  return rows.map(notificationPublic);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -2554,11 +3006,7 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isFinite(level)) {
         return send(res, 400, { error: 'Falta el nivel de batería.' });
       }
-      let device = body.deviceId
-        ? await db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
-        : await db
-            .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
-            .get(user.id);
+      let device = await resolveOwnedDevice(user.id, body.deviceId);
       if (!device) {
         const id = uuid();
         await db.prepare(
@@ -2609,11 +3057,7 @@ const server = http.createServer(async (req, res) => {
       if (state !== 'foreground' && state !== 'background') {
         return send(res, 400, { error: 'Estado inválido.' });
       }
-      let device = body.deviceId
-        ? await db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
-        : await db
-            .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
-            .get(user.id);
+      let device = await resolveOwnedDevice(user.id, body.deviceId);
       if (!device) {
         return send(res, 404, { error: 'No encontramos este celular.' });
       }
@@ -2659,11 +3103,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const geo = coordsFromBody(body);
       if (!geo) return send(res, 400, { error: 'Falta la ubicación (lat/lng).' });
-      let device = body.deviceId
-        ? await db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
-        : await db
-            .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
-            .get(user.id);
+      let device = await resolveOwnedDevice(user.id, body.deviceId);
       if (!device) {
         return send(res, 404, { error: 'No encontramos este celular.' });
       }
@@ -2678,6 +3118,7 @@ const server = http.createServer(async (req, res) => {
       const trip = user.role === 'kid' ? await liveKidTrip(user.id) : null;
       return send(res, 200, {
         ok: true,
+        deviceId: device.id,
         events: locationEvents.map((e) => e.event),
         trip: trip ? await tripPublic(trip) : null,
         geofences: user.role === 'kid' ? await monitorGeofencesForKid(user) : [],
@@ -2688,11 +3129,7 @@ const server = http.createServer(async (req, res) => {
       const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
       const body = await readBody(req);
-      let device = body.deviceId
-        ? await db.prepare('SELECT * FROM devices WHERE id = ? AND user_id = ?').get(body.deviceId, user.id)
-        : await db
-            .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
-            .get(user.id);
+      let device = await resolveOwnedDevice(user.id, body.deviceId);
       if (!device) {
         const id = uuid();
         await db.prepare(
@@ -3119,9 +3556,7 @@ const server = http.createServer(async (req, res) => {
       if (!kidId) return send(res, 400, { error: 'Indicá el hijo/a.' });
       const kid = await db.prepare('SELECT * FROM users WHERE id = ? AND family_id = ?').get(kidId, user.family_id);
       if (!kid) return send(res, 404, { error: 'No encontramos a esa persona.' });
-      const trip = await db
-        .prepare(`SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC LIMIT 1`)
-        .get(kidId);
+      const trip = await liveKidTrip(kidId);
       return send(res, 200, {
         trip: trip ? await tripPublic(trip) : null,
         geofences: await monitorGeofencesForKid(kid),
@@ -3129,8 +3564,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/trips') {
-      const user = await authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = await requireFamilyUser(req, res);
+      if (!user) return;
       const body = await readBody(req);
       const kidId = user.role === 'kid' ? user.id : body.kidId;
       const kid = await db
@@ -3140,98 +3575,19 @@ const server = http.createServer(async (req, res) => {
       if (user.role === 'kid' && user.id !== kid.id) {
         return send(res, 403, { error: 'Solo podés avisar tu propia salida.' });
       }
-      const existing = await db
-        .prepare(`SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue')`)
-        .get(kid.id);
-      if (existing) {
-        return send(res, 400, { error: 'Ya hay una salida en curso. Primero marcá que llegaste.' });
+      const keyResult = parseIdempotencyKey(req);
+      if (keyResult.error) {
+        return send(res, 400, { error: keyResult.error, code: 'idempotency_key_invalid' });
       }
-      let dest = await resolveOrCreateTripDestination(user, body);
-      if (body.destinationPlaceId && !dest) {
-        return send(res, 404, { error: 'Ese lugar no está disponible.' });
-      }
-      const kind = String(body.kind ?? '');
-      const wantsWalkingHome = kind === 'walking_home';
-      if (!dest && wantsWalkingHome) {
-        dest = await familyHomePlace(user.family_id);
-        if (!dest) {
-          return send(res, 400, {
-            error: 'Todavía no hay un lugar Casa. Pedile a un adulto que lo agregue.',
-          });
-        }
-      }
-      if (!dest) {
-        return send(res, 400, { error: 'Elegí a dónde va la salida.' });
-      }
-      const id = uuid();
-      const expected = body.expectedReturnAt ? String(body.expectedReturnAt) : null;
-      const home = await familyHomePlace(user.family_id);
-      const now = nowIso();
-      // Regreso a casa: el menor ya está afuera (plaza, escuela, etc.).
-      // Si nace en pending_departure, la llegada a Casa se descarta porque
-      // specialTripLeftHome sigue en falso (la salida de la plaza fue antes).
-      // Una salida Casa → otro lugar sigue en pending_departure hasta el EXIT.
-      const goingHome = wantsWalkingHome || dest?.type === 'home';
-      const phase = dest?.id ? (goingHome ? 'en_route' : 'pending_departure') : null;
-      const departedAt = goingHome && dest?.id ? now : null;
-      await db.prepare(
-        `INSERT INTO trips
-         (id, kid_id, origin_place_id, destination_place_id, status, expected_return_at, started_at, created_at, phase, departed_at, created_by_user_id, created_by_name)
-         VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        id,
-        kid.id,
-        home?.id ?? null,
-        dest?.id ?? null,
-        expected,
-        now,
-        now,
-        phase,
-        departedAt,
-        user.id,
-        user.name,
+      const outcome = await withKidLock(kid.id, () =>
+        createKidTrip({
+          user,
+          kid,
+          body,
+          idempotencyKey: keyResult.key,
+        }),
       );
-      const trip = await db.prepare('SELECT * FROM trips WHERE id = ?').get(id);
-      const destIsHome = dest?.type === 'home';
-      const isWalkingHome = kind === 'walking_home' || destIsHome;
-
-      // Menor avisa “Regreso a casa” / salida: crear evento + push a adultos.
-      if (user.role === 'kid') {
-        const eventType = isWalkingHome ? 'walking_home' : 'going_to';
-        const created = await createEvent({
-          kid: user,
-          type: eventType,
-          placeId: dest?.id ?? null,
-          tripId: id,
-          forceNotify: true,
-          payload: {
-            source: 'trip_start',
-            kind: kind || eventType,
-            destinationPlaceId: dest?.id ?? null,
-            destinationName: dest?.name ?? null,
-            createdByUserId: user.id,
-          },
-        });
-        const fresh = await db.prepare('SELECT * FROM trips WHERE id = ?').get(id);
-        return send(res, 201, {
-          trip: await tripPublic(fresh),
-          event: created.event,
-          notifiedCount: created.notifiedCount,
-        });
-      }
-
-      let notifiedCount = 0;
-      if (isAdultRole(user.role)) {
-        const destLabel = dest?.name ? ` a ${dest.name}` : '';
-        notifiedCount = await notifyKidUser(
-          kid.id,
-          'Salida especial',
-          isWalkingHome
-            ? 'Te armaron un regreso a casa'
-            : `Te armaron una salida especial${destLabel}`,
-        );
-      }
-      return send(res, 201, { trip: await tripPublic(trip), event: null, notifiedCount });
+      return send(res, outcome.status, outcome.body);
     }
     if (req.method === 'PATCH' && pathname.startsWith('/trips/')) {
       const user = await authUser(req);
@@ -3311,9 +3667,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     // EVENTS
+    // Autoriza la sesión del hijo/a, no el id del celular. Re-vincular o migrar
+    // el install no tiene que responder 401/403 ni ignorar la salida o la llegada.
     if (req.method === 'POST' && pathname === '/events') {
-      const user = await authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = await requireFamilyUser(req, res);
+      if (!user) return;
       const body = await readBody(req);
       const type = String(body.type ?? '');
       const allowed = [
@@ -3393,14 +3751,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && pathname === '/events') {
       const user = await authUser(req);
       if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
-      const since = url.searchParams.get('since');
+      const sinceParam = parseSinceParam(url.searchParams.get('since'));
+      if (sinceParam.error) return send(res, 400, { error: sinceParam.error });
+      const since = sinceParam.since;
       const kidId = url.searchParams.get('kidId');
       let rows;
       if (user.role === 'kid') {
         rows = await db
           .prepare(
             since
-              ? `SELECT * FROM events WHERE kid_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 50`
+              ? `SELECT * FROM events WHERE kid_id = ? AND created_at >= ? ORDER BY created_at ASC LIMIT 500`
               : `SELECT * FROM events WHERE kid_id = ? ORDER BY created_at DESC LIMIT 50`,
           )
           .all(...(since ? [user.id, since] : [user.id]));
@@ -3416,7 +3776,7 @@ const server = http.createServer(async (req, res) => {
         rows = await db
           .prepare(
             since
-              ? `SELECT * FROM events WHERE kid_id IN (${placeholders}) AND created_at >= ? ORDER BY created_at DESC LIMIT 50`
+              ? `SELECT * FROM events WHERE kid_id IN (${placeholders}) AND created_at >= ? ORDER BY created_at ASC LIMIT 500`
               : `SELECT * FROM events WHERE kid_id IN (${placeholders}) ORDER BY created_at DESC LIMIT 50`,
           )
           .all(...(since ? [...kids, since] : kids));
@@ -3427,26 +3787,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && pathname === '/notifications/me') {
       const user = await authUser(req);
       if (!user) return send(res, 401, { error: 'Tenés que iniciar sesión.' });
-      const rows = (await db
-        .prepare(
-          `SELECT * FROM notifications WHERE recipient_user_id = ? ORDER BY created_at DESC LIMIT 40`,
-        )
-        .all(user.id)
-      ).map((n) => ({
-          id: n.id,
-          eventId: n.event_id,
-          status: n.status,
-          title: n.title,
-          body: n.body,
-          sentAt: n.sent_at,
-          createdAt: n.created_at,
-        }));
-      return send(res, 200, { notifications: rows });
+      const sinceParam = parseSinceParam(url.searchParams.get('since'));
+      if (sinceParam.error) return send(res, 400, { error: sinceParam.error });
+      const notifications = await listNotifications(user.id, sinceParam.since);
+      return send(res, 200, { notifications });
     }
 
     if (req.method === 'GET' && pathname === '/family/status') {
-      const user = await authUser(req);
-      if (!user?.family_id) return send(res, 400, { error: 'Todavía no estás en una familia.' });
+      const user = await requireFamilyUser(req, res);
+      if (!user) return;
       const family = await db.prepare('SELECT * FROM families WHERE id = ?').get(user.family_id);
       const memberRows = await db
         .prepare('SELECT * FROM users WHERE family_id = ? ORDER BY created_at ASC')
@@ -3456,14 +3805,7 @@ const server = http.createServer(async (req, res) => {
         const device = await db
           .prepare('SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
           .get(m.id);
-        const activeTrip =
-          m.role === 'kid'
-            ? await db
-                .prepare(
-                  `SELECT * FROM trips WHERE kid_id = ? AND status IN ('active','overdue') ORDER BY started_at DESC LIMIT 1`,
-                )
-                .get(m.id)
-            : null;
+        const activeTrip = m.role === 'kid' ? await liveKidTrip(m.id) : null;
         const lastEventRaw =
           m.role === 'kid'
             ? await db
@@ -3550,25 +3892,15 @@ const server = http.createServer(async (req, res) => {
           `SELECT e.* FROM events e
            JOIN users u ON u.id = e.kid_id
            WHERE u.family_id = ? AND u.role = 'kid'
-           ORDER BY e.created_at DESC LIMIT 20`,
+           ORDER BY e.created_at DESC LIMIT 100`,
         )
         .all(user.family_id)
       ).map(eventPublic);
       // Adultos: todos sus avisos. Hijo/a: solo aceptaciones (lugar / salida armada).
-      const myNotifications = (await db
-        .prepare(
-          `SELECT * FROM notifications WHERE recipient_user_id = ? ORDER BY created_at DESC LIMIT 20`,
-        )
-        .all(user.id)
-      ).map((n) => ({
-        id: n.id,
-        eventId: n.event_id,
-        status: n.status,
-        title: n.title,
-        body: n.body,
-        sentAt: n.sent_at,
-        createdAt: n.created_at,
-      }));
+      // notificationsSince deja traer los que se perdieron con la app cerrada horas.
+      const notesSince = parseSinceParam(url.searchParams.get('notificationsSince'));
+      if (notesSince.error) return send(res, 400, { error: notesSince.error });
+      const myNotifications = await listNotifications(user.id, notesSince.since);
       return send(res, 200, {
         family: { id: family.id, name: family.name, createdAt: family.created_at },
         members,
@@ -3614,6 +3946,7 @@ server.on('error', (err) => {
 
 async function runJobs(label) {
   try {
+    await expireStaleTrips();
     await checkDelayedTrips();
     await checkReturnPrompts();
     await checkRoutineDelays();

@@ -11,6 +11,7 @@ import { openDatabase } from './db.mjs';
 import { ensureSchema } from './schema.mjs';
 
 const TABLES = [
+  'trip_idempotency',
   'notifications',
   'events',
   'alert_prefs',
