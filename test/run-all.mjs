@@ -10,6 +10,7 @@ const files = [
   'test/sql-pg-params.mjs',
   'test/trial-page-hides-otp.mjs',
   'test/special-trip-cancel.mjs',
+  'test/trip-retry-and-events.mjs',
   'test/invite-auth-refresh.mjs',
   'test/share-place-auth.mjs',
   'test/presence-home-sharing.mjs',

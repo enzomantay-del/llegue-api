@@ -168,6 +168,15 @@ CREATE TABLE IF NOT EXISTS account_profiles (
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
+CREATE TABLE IF NOT EXISTS trip_idempotency (
+  user_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  trip_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, idempotency_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_family ON users(family_id);
 CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_codes(phone);
 CREATE INDEX IF NOT EXISTS idx_places_family ON places(family_id);

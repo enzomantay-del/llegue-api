@@ -30,6 +30,7 @@ Copiá `.env.example` a `.env` en local.
 | `PORT` | no | Render lo inyecta. Local: 8787. |
 | `SEED_FAMILIA` | no | En prod dejar `false`. |
 | `OTP_DEV_CODE` | sí, para entrar | Solo en el entorno (local o Render). No tiene valor por defecto en el repo. |
+| `TRIP_STALE_HOURS` | no | Horas sin novedades para cerrar una salida abierta. Default 12. |
 
 ## Cómo probar
 
